@@ -1,0 +1,1127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>scion-hev3 — Codebase Guide</title>
+<style>
+:root {
+  --bg: #fdfdfc;
+  --fg: #1d2129;
+  --muted: #5b6470;
+  --accent: #0d5fa8;
+  --accent-soft: #e3eef8;
+  --border: #d4d8de;
+  --code-bg: #f2f3f5;
+  --code-fg: #24292f;
+  --box-bg: #f7f8fa;
+  --warn-bg: #fdf6e3;
+  --warn-border: #d9b44a;
+  --diag-box: #eef2f7;
+  --diag-stroke: #8a94a3;
+  --diag-arrow: #0d5fa8;
+  --diag-dash: #9aa4b2;
+  --toc-active: #0d5fa8;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16181d;
+    --fg: #d8dce3;
+    --muted: #949ead;
+    --accent: #6fb1e8;
+    --accent-soft: #1d2a3a;
+    --border: #333a45;
+    --code-bg: #1f232b;
+    --code-fg: #d3d9e1;
+    --box-bg: #1b1f26;
+    --warn-bg: #2a2618;
+    --warn-border: #8a7530;
+    --diag-box: #222834;
+    --diag-stroke: #5b6577;
+    --diag-arrow: #6fb1e8;
+    --diag-dash: #566072;
+    --toc-active: #6fb1e8;
+  }
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+.layout {
+  display: grid;
+  grid-template-columns: 260px minmax(0, 1fr);
+  max-width: 1280px;
+  margin: 0 auto;
+  gap: 0 2.5rem;
+  padding: 0 1.25rem;
+}
+nav.toc {
+  position: sticky;
+  top: 0;
+  align-self: start;
+  max-height: 100vh;
+  overflow-y: auto;
+  padding: 1.5rem 0.5rem 2rem 0;
+  font-size: 0.85rem;
+  border-right: 1px solid var(--border);
+}
+nav.toc h2 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 0 0 0.5rem; }
+nav.toc ol { list-style: none; margin: 0; padding: 0; }
+nav.toc li { margin: 0.15rem 0; }
+nav.toc li.sub { padding-left: 0.9rem; }
+nav.toc a { color: var(--muted); text-decoration: none; display: block; padding: 0.1rem 0.4rem; border-left: 2px solid transparent; }
+nav.toc a:hover { color: var(--fg); }
+nav.toc a.active { color: var(--toc-active); border-left-color: var(--toc-active); font-weight: 600; }
+main { min-width: 0; padding: 1.5rem 0 5rem; }
+h1 { font-size: 1.8rem; line-height: 1.25; margin: 0.5rem 0 0.25rem; }
+h2 { font-size: 1.35rem; margin: 3rem 0 0.75rem; padding-top: 0.75rem; border-top: 1px solid var(--border); }
+h3 { font-size: 1.05rem; margin: 1.75rem 0 0.5rem; }
+h2 .file, h3 .file { font-weight: 400; font-size: 0.8em; color: var(--muted); font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; margin-left: 0.5rem; }
+p { margin: 0.6rem 0; }
+a { color: var(--accent); }
+code, .mono {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.86em;
+  background: var(--code-bg);
+  color: var(--code-fg);
+  border-radius: 3px;
+  padding: 0.08em 0.3em;
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.75rem 1rem;
+  overflow-x: auto;
+  font-size: 0.82rem;
+  line-height: 1.5;
+}
+pre code { background: none; padding: 0; font-size: 1em; }
+.subtitle { color: var(--muted); font-size: 1.02rem; margin-bottom: 1.5rem; }
+.tablewrap { overflow-x: auto; margin: 0.75rem 0; }
+table { border-collapse: collapse; font-size: 0.86rem; min-width: 100%; }
+th, td { text-align: left; padding: 0.45rem 0.7rem; border: 1px solid var(--border); vertical-align: top; }
+th { background: var(--box-bg); font-weight: 600; }
+td code { white-space: nowrap; }
+.diagram {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--box-bg);
+  margin: 1rem 0;
+  padding: 0.5rem;
+}
+.diagram svg { display: block; min-width: 880px; width: 100%; height: auto; }
+.diag-box { fill: var(--diag-box); stroke: var(--diag-stroke); stroke-width: 1.2; rx: 6; }
+.diag-title { fill: var(--fg); font: 600 13.5px ui-monospace, Menlo, Consolas, monospace; }
+.diag-text { fill: var(--muted); font: 12px system-ui, sans-serif; }
+.diag-code { fill: var(--muted); font: 11.5px ui-monospace, Menlo, Consolas, monospace; }
+.diag-arrow { stroke: var(--diag-arrow); stroke-width: 1.5; fill: none; marker-end: url(#arr); }
+.diag-arrow2 { stroke: var(--diag-arrow); stroke-width: 1.5; fill: none; marker-end: url(#arr2); }
+.diag-dashed { stroke: var(--diag-dash); stroke-width: 1.2; stroke-dasharray: 4 4; fill: none; marker-end: url(#arrd); }
+.diag-edge-label { fill: var(--accent); font: 11.5px ui-monospace, Menlo, Consolas, monospace; }
+.diag-note { fill: var(--muted); font: italic 11.5px system-ui, sans-serif; }
+.invariant {
+  border-left: 3px solid var(--accent);
+  background: var(--accent-soft);
+  padding: 0.6rem 1rem;
+  margin: 1rem 0;
+  border-radius: 0 6px 6px 0;
+  font-size: 0.92rem;
+}
+.invariant strong:first-child { color: var(--accent); }
+.caveat {
+  border-left: 3px solid var(--warn-border);
+  background: var(--warn-bg);
+  padding: 0.6rem 1rem;
+  margin: 1rem 0;
+  border-radius: 0 6px 6px 0;
+  font-size: 0.92rem;
+}
+ul, ol { padding-left: 1.4rem; }
+li { margin: 0.25rem 0; }
+dl.gloss dt { font-family: ui-monospace, Menlo, Consolas, monospace; font-weight: 600; margin-top: 0.8rem; }
+dl.gloss dd { margin: 0.15rem 0 0 1.2rem; color: var(--fg); }
+.pipeline-inline { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.9em; }
+@media (max-width: 1000px) {
+  .layout { display: block; }
+  nav.toc { position: static; max-height: none; border-right: none; border-bottom: 1px solid var(--border); padding: 1rem 0; }
+  nav.toc ol { column-count: 2; column-gap: 2rem; }
+}
+</style>
+</head>
+<body>
+<div class="layout">
+
+<nav class="toc" id="toc">
+<h2>Contents</h2>
+<ol>
+<li><a href="#intro">1. What this is</a></li>
+<li><a href="#architecture">2. Architecture overview</a></li>
+<li class="sub"><a href="#arch-pipeline">2.1 The Fetch pipeline</a></li>
+<li class="sub"><a href="#arch-engine-states">2.2 Engine state machine</a></li>
+<li><a href="#types">3. types.go — Candidate anatomy</a></li>
+<li><a href="#resolver">4. resolver.go — DNS to candidates</a></li>
+<li><a href="#engine">5. engine.go — the connection engine</a></li>
+<li><a href="#race">6. race.go — static-set wrapper</a></li>
+<li><a href="#sort">7. sort.go + rfc6724.go — ordering</a></li>
+<li><a href="#dial-scion">8. dial_scion.go — expansion &amp; native dial</a></li>
+<li><a href="#dial-scitra">9. dial_scitra.go — the translator leg</a></li>
+<li><a href="#dial-ip">10. dial_ip.go — dispatch &amp; IP dials</a></li>
+<li><a href="#timeline">11. timeline.go — the event bus</a></li>
+<li><a href="#fetch">12. hev3.go — Fetch wiring</a></li>
+<li><a href="#cli">13. cmd/hev3 — the CLI</a></li>
+<li><a href="#server">14. cmd/hev3-server — demo target</a></li>
+<li><a href="#cross-cutting">15. Cross-cutting concerns</a></li>
+<li class="sub"><a href="#seams">15.1 Test seams</a></li>
+<li class="sub"><a href="#forks">15.2 Forked dependencies</a></li>
+<li class="sub"><a href="#invariants">15.3 Load-bearing invariants</a></li>
+<li><a href="#glossary">16. Glossary</a></li>
+</ol>
+</nav>
+
+<main>
+
+<h1 id="intro">scion-hev3 — Codebase Guide</h1>
+<p class="subtitle">Happy Eyeballs v3 with SCION as a third address family: a racing client library, CLI, and demo server, plus the IETF drafts that define how it all works on the wire.</p>
+
+<p><strong>What this project is.</strong> <code>pkg/hev3</code> implements
+<a href="https://datatracker.ietf.org/doc/draft-ietf-happy-happyeyeballs-v3/">draft-ietf-happy-happyeyeballs-v3-04</a>
+extended with <a href="https://scion-architecture.net/">SCION</a>: it resolves a name via HTTPS/SVCB
+(including the <code>scion=</code> and <code>scion-policy=</code> SvcParams), AAAA and A, builds a candidate list spanning
+three families (SCION, IPv6, IPv4), and races connection attempts with HEv3 staggering — first
+successful connection wins. <code>cmd/hev3</code> is the CLI front-end (<code>hev3 https://web.scion/</code>);
+<code>cmd/hev3-server</code> is the demo target that serves the same page over every transport and tags each
+response with the transport that delivered it. Two companion drafts (maintained separately in <a href="https://github.com/netsys-lab/draft-scion-svcb">netsys-lab/draft-scion-svcb</a>):
+<em>draft-john-scion-svcb-01</em> defines the <code>scion</code> (65280) and <code>scion-policy</code> (65281)
+SvcParamKeys (discovery), and <em>draft-john-scion-hev3-00</em> defines the client algorithm this library
+implements (asynchronous path expansion, three-family sorting, adaptive staggering, the optional
+Expansion Delay). Built for the SCION testbed at the IETF 126 hackathon.</p>
+
+<p><strong>How to read this guide.</strong> Section 2 gives the end-to-end picture — read it first;
+everything later hangs off its two diagrams. Sections 3–14 are per-file deep dives ordered roughly by
+data flow (types → resolver → engine → dialers → CLI/server); each names its file and key
+functions so you can jump straight into the source. Section 15 collects what cuts across files: the
+test seams, the two forked dependencies the build depends on, and the invariants that are easy to
+break when refactoring. Section 16 is a glossary of project jargon. Every claim in this guide was
+written against the actual code on this branch; function names are given instead of line numbers
+because lines drift.</p>
+
+<h2 id="architecture">2. Architecture overview</h2>
+
+<h3 id="arch-pipeline">2.1 The Fetch pipeline <span class="file">pkg/hev3/hev3.go</span></h3>
+
+<p><code>hev3.Fetch</code> is the whole pipeline:
+<span class="pipeline-inline">resolve → engine (live merge + async expansion + sort + staggered racing) → winner GET</span>.
+Unlike a textbook HEv3 flow that resolves, sorts once, and races a fixed list, the engine here is a
+single-goroutine scheduler that keeps merging two asynchronous inputs into a <em>running</em> race: the
+resolver's <code>Updates</code> channel (later DNS answers) and expander goroutines (SCION path lookup
+results). The diagram below shows the real data flow — every box is a concrete type or function.</p>
+
+<div class="diagram" role="img" aria-label="Fetch pipeline data-flow diagram">
+<svg viewBox="0 0 980 668" xmlns="http://www.w3.org/2000/svg">
+<defs>
+<marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M0,0 L10,5 L0,10 z" fill="var(--diag-arrow)"/>
+</marker>
+<marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M0,0 L10,5 L0,10 z" fill="var(--diag-arrow)"/>
+</marker>
+<marker id="arrd" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<path d="M0,0 L10,5 L0,10 z" fill="var(--diag-dash)"/>
+</marker>
+</defs>
+
+<!-- ResolveHost box -->
+<rect class="diag-box" x="20" y="30" width="280" height="150" rx="6"/>
+<text class="diag-title" x="35" y="55">ResolveHost (resolver.go)</text>
+<text class="diag-text" x="35" y="78">HTTPS + SVCB + AAAA + A in parallel;</text>
+<text class="diag-text" x="35" y="95">dynamic query set (TargetName chase)</text>
+<text class="diag-text" x="35" y="118">§4.2 Resolution Delay gate → Initial</text>
+<text class="diag-text" x="35" y="135">later merges → Updates (complete sets,</text>
+<text class="diag-text" x="35" y="152">each send replaces the previous)</text>
+
+<!-- engine box -->
+<rect class="diag-box" x="420" y="30" width="300" height="215" rx="6"/>
+<text class="diag-title" x="435" y="55">engine.loop (engine.go)</text>
+<text class="diag-code" x="435" y="80">table  map[Label]*tableEntry</text>
+<text class="diag-code" x="435" y="98">order  []label (insertion)</text>
+<text class="diag-code" x="435" y="116">pending []label (sorted, unlaunched)</text>
+<text class="diag-code" x="435" y="134">timer      — attempt stagger</text>
+<text class="diag-code" x="435" y="152">graceTimer — SCION-grace hold</text>
+<text class="diag-text" x="435" y="178">resort() runs sortFn (Sort, sort.go)</text>
+<text class="diag-text" x="435" y="196">over the complete live set on every</text>
+<text class="diag-text" x="435" y="214">ingest / expansion arrival (§7)</text>
+
+<!-- expander box -->
+<rect class="diag-box" x="770" y="45" width="192" height="130" rx="6"/>
+<text class="diag-title" x="783" y="70">expander goroutines</text>
+<text class="diag-text" x="783" y="92">ExpandSCION(ctx, proto)</text>
+<text class="diag-text" x="783" y="109">one goroutine per proto</text>
+<text class="diag-text" x="783" y="126">candidate; run under</text>
+<text class="diag-code" x="783" y="145">e.expandCtx</text>
+<text class="diag-text" x="783" y="163">(dies with the loop)</text>
+
+<!-- resolver -> engine arrows -->
+<path class="diag-arrow" d="M300,85 L418,85"/>
+<text class="diag-edge-label" x="308" y="78">Initial []Candidate (once)</text>
+<path class="diag-arrow" d="M300,140 L418,140"/>
+<text class="diag-edge-label" x="308" y="133">Updates &lt;-chan []Candidate</text>
+
+<!-- engine <-> expander -->
+<path class="diag-arrow" d="M720,90 L768,90"/>
+<text class="diag-edge-label" x="700" y="82" text-anchor="end">proto cand</text>
+<path class="diag-arrow" d="M770,145 L722,145"/>
+<text class="diag-edge-label" x="958" y="196" text-anchor="end">expandResult{parent, children}</text>
+
+<!-- engine -> dialfunc -->
+<rect class="diag-box" x="420" y="320" width="300" height="72" rx="6"/>
+<text class="diag-title" x="435" y="345">DialFunc = NewDialer(dOpts)</text>
+<text class="diag-text" x="435" y="366">(dial_ip.go) — one goroutine per</text>
+<text class="diag-text" x="435" y="383">launched attempt, ctx-cancellable</text>
+
+<path class="diag-arrow" d="M540,245 L540,318"/>
+<text class="diag-edge-label" x="548" y="280">launch (staggered)</text>
+<path class="diag-arrow" d="M610,318 L610,247"/>
+<text class="diag-edge-label" x="618" y="290">attemptResult{est|err}</text>
+
+<!-- winner box -->
+<rect class="diag-box" x="20" y="320" width="280" height="72" rx="6"/>
+<text class="diag-title" x="35" y="345">winner: *Established</text>
+<text class="diag-text" x="35" y="366">first success → finish(): cancel the</text>
+<text class="diag-text" x="35" y="383">rest → getOverWinner GET (hev3.go)</text>
+<path class="diag-arrow" d="M420,356 L302,356"/>
+<text class="diag-edge-label" x="310" y="349">first success</text>
+
+<!-- three dialer families -->
+<rect class="diag-box" x="150" y="460" width="240" height="102" rx="6"/>
+<text class="diag-title" x="165" y="485">dialSCION (dial_scion.go)</text>
+<text class="diag-text" x="165" y="507">native h3 over SCION QUIC</text>
+<text class="diag-text" x="165" y="524">(snet conn + quic.Transport),</text>
+<text class="diag-text" x="165" y="541">pinned dataplane Path + next hop</text>
+
+<rect class="diag-box" x="420" y="460" width="230" height="102" rx="6"/>
+<text class="diag-title" x="435" y="485">dialScitra (dial_scitra.go)</text>
+<text class="diag-text" x="435" y="507">mapped-IPv6 dial over the</text>
+<text class="diag-text" x="435" y="524">fc00::/8 translator route</text>
+<text class="diag-text" x="435" y="541">(= dialIP on the mapped addr)</text>
+
+<rect class="diag-box" x="680" y="460" width="282" height="102" rx="6"/>
+<text class="diag-title" x="695" y="485">dialIP (dial_ip.go)</text>
+<text class="diag-text" x="695" y="507">h3 over QUIC when ALPN offers h3,</text>
+<text class="diag-text" x="695" y="524">else TCP+TLS negotiating</text>
+<text class="diag-text" x="695" y="541">h2 / http1.1</text>
+
+<path class="diag-arrow" d="M470,392 L300,458"/>
+<text class="diag-edge-label" x="220" y="430">Family==SCION &amp;&amp; Path</text>
+<path class="diag-arrow" d="M545,392 L545,458"/>
+<text class="diag-edge-label" x="553" y="430">ViaScitra</text>
+<path class="diag-arrow" d="M660,392 L800,458"/>
+<text class="diag-edge-label" x="760" y="430">else (IP)</text>
+
+<!-- Timeline bus -->
+<rect class="diag-box" x="20" y="600" width="942" height="52" rx="6"/>
+<text class="diag-title" x="35" y="623">Timeline (timeline.go) — cross-cutting event bus</text>
+<text class="diag-text" x="35" y="642">resolver: query / answer / candidate / fail-notes · engine: attempt / success / fail / cancel / winner · expansion: fail (drop) notes</text>
+
+<path class="diag-dashed" d="M160,180 L160,598"/>
+<path class="diag-dashed" d="M700,562 L700,598"/>
+<path class="diag-dashed" d="M866,175 L866,598"/>
+</svg>
+</div>
+
+<p>Reading the diagram: <code>ResolveHost</code> hands the engine an <code>Initial</code> candidate set (gated by
+the §4.2 Resolution Delay) and then streams later <em>complete</em> sets on <code>Updates</code>. The engine
+ingests each set into its candidate table; SCION candidates arrive as <em>proto-candidates</em>
+(<code>FamilySCION</code>, <code>Path == nil</code>) that are not dialable yet, so <code>ingest</code> hands each to an
+expander goroutine (<code>ExpandSCION</code>) instead of the pending list. Expansion results come back as
+<code>expandResult</code>s whose children (per-path native candidates <code>#p1..#pK</code>, or one scitra
+fallback) enter the table like any other candidate. Every ingest re-sorts the complete live set
+(<code>Sort</code>), so a late arrival is positioned as if it had been present from the start. Launches are
+staggered by the attempt-delay timer; each launched attempt is one goroutine calling the
+<code>DialFunc</code>, which dispatches to one of three dialer families. First success cancels everything
+else and the winning <code>*Established</code> carries the single GET. Every stage appends to the shared
+<code>Timeline</code>, which the CLI renders as the race table.</p>
+
+<h3 id="arch-engine-states">2.2 Engine state machine <span class="file">pkg/hev3/engine.go</span></h3>
+
+<p>Each table entry has one of six statuses. Only the engine loop goroutine mutates them, so there
+are no locks — attempt and expansion goroutines communicate exclusively through the
+<code>results</code> and <code>expandResults</code> channels.</p>
+
+<div class="diagram" role="img" aria-label="Engine candidate state machine">
+<svg viewBox="0 0 940 470" xmlns="http://www.w3.org/2000/svg">
+<defs>
+<marker id="arrS" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M0,0 L10,5 L0,10 z" fill="var(--diag-arrow)"/>
+</marker>
+<marker id="arrSd" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<path d="M0,0 L10,5 L0,10 z" fill="var(--diag-dash)"/>
+</marker>
+</defs>
+
+<!-- proto path -->
+<rect class="diag-box" x="60" y="40" width="180" height="56" rx="10"/>
+<text class="diag-title" x="150" y="63" text-anchor="middle">candExpanding</text>
+<text class="diag-text" x="150" y="83" text-anchor="middle">proto handed to expander</text>
+
+<rect class="diag-box" x="360" y="40" width="180" height="56" rx="10"/>
+<text class="diag-title" x="450" y="63" text-anchor="middle">candExpanded</text>
+<text class="diag-text" x="450" y="83" text-anchor="middle">children now in table</text>
+
+<!-- dialable path -->
+<rect class="diag-box" x="60" y="230" width="180" height="56" rx="10"/>
+<text class="diag-title" x="150" y="253" text-anchor="middle">candNew</text>
+<text class="diag-text" x="150" y="273" text-anchor="middle">in table, maybe pending</text>
+
+<rect class="diag-box" x="360" y="230" width="180" height="56" rx="10"/>
+<text class="diag-title" x="450" y="253" text-anchor="middle">candInflight</text>
+<text class="diag-text" x="450" y="273" text-anchor="middle">dial goroutine running</text>
+
+<rect class="diag-box" x="680" y="150" width="180" height="56" rx="10"/>
+<text class="diag-title" x="770" y="173" text-anchor="middle">candDone</text>
+<text class="diag-text" x="770" y="193" text-anchor="middle">won — or §7 tombstone</text>
+
+<rect class="diag-box" x="680" y="330" width="180" height="56" rx="10"/>
+<text class="diag-title" x="770" y="353" text-anchor="middle">candFailed</text>
+<text class="diag-text" x="770" y="373" text-anchor="middle">err kept for failure()</text>
+
+<!-- entry arrows -->
+<path class="diag-arrow" d="M10,68 L58,68" marker-end="url(#arrS)"/>
+<text class="diag-edge-label" x="8" y="30">ingest: isProto(c)</text>
+<path class="diag-arrow" d="M10,258 L58,258" marker-end="url(#arrS)"/>
+<text class="diag-edge-label" x="8" y="222">ingest: dialable</text>
+
+<!-- expanding -> expanded -->
+<path class="diag-arrow" d="M240,68 L358,68" marker-end="url(#arrS)"/>
+<text class="diag-edge-label" x="248" y="60">expandResult recv</text>
+
+<!-- expanded -> children (dashed to candNew) -->
+<path class="diag-dashed" d="M450,96 C450,170 260,190 210,228" marker-end="url(#arrSd)"/>
+<text class="diag-note" x="400" y="160">children ingested as candNew</text>
+<text class="diag-note" x="400" y="177">(entry.parent = proto label)</text>
+
+<!-- candNew -> candInflight -->
+<path class="diag-arrow" d="M240,258 L358,258" marker-end="url(#arrS)"/>
+<text class="diag-edge-label" x="248" y="250">launchNext()</text>
+
+<!-- candNew -> candDone (tombstone) -->
+<path class="diag-arrow" d="M195,230 C300,120 560,130 678,168" marker-end="url(#arrS)"/>
+<text class="diag-edge-label" x="470" y="122">§7 tombstone: label (or proto parent)</text>
+<text class="diag-edge-label" x="470" y="139">missing from an update set, never launched</text>
+
+<!-- candInflight -> candDone -->
+<path class="diag-arrow" d="M540,244 L678,196" marker-end="url(#arrS)"/>
+<text class="diag-edge-label" x="548" y="224">dial ok → finish(), loop returns</text>
+
+<!-- candInflight -> candFailed -->
+<path class="diag-arrow" d="M540,272 L678,344" marker-end="url(#arrS)"/>
+<text class="diag-edge-label" x="548" y="316">dial err (§6 promote if most-recent)</text>
+
+<!-- notes -->
+<text class="diag-note" x="60" y="430">Losers cancelled by finish() keep status candInflight — the loop has already returned; drainClose reaps their results.</text>
+<text class="diag-note" x="60" y="450">Tombstones are permanent within a run: a label re-added by a later update is skipped by ingest, so DNS flapping is never re-raced.</text>
+</svg>
+</div>
+
+<p>Two subtleties the diagram encodes: (1) a <em>tombstone</em> is <code>candDone</code> with
+<code>cancel == nil &amp;&amp; err == nil</code> — that exact triple is what <code>resort</code> tests to exclude
+tombstones from the live list; (2) proto parents (<code>candExpanding</code>/<code>candExpanded</code>) are
+placeholders that never appear in the sorted live list — only their children race.</p>
+
+<h2 id="types">3. types.go — Candidate anatomy <span class="file">pkg/hev3/types.go</span></h2>
+
+<p>The whole pipeline trades in one currency: <code>Candidate</code>, one dialable destination.</p>
+
+<pre><code>type Candidate struct {
+    Family    Family      // FamilySCION | FamilyIPv6 | FamilyIPv4
+    Host      string      // IP literal, or SCION host IP
+    Port      uint16
+    IA        string      // "1-150"; empty for IP families
+    Path      *SCIONPath  // nil for IP families and the scitra leg
+    ViaScitra bool        // SCION-derived candidate dialed as mapped IPv6
+    ALPN      []string    // dial ALPN; empty = default (try h2/h1.1 over TCP)
+    GroupALPN []string    // covering record's full ALPN set — §5.1 grouping key
+    Priority  uint16      // SvcPriority
+    Label     string      // stable human id, e.g. "scion:1-150#p1", "v6:2001:db8::1"
+    Policy    *PathPolicy // scion-policy hint; SCION candidates only
+}</code></pre>
+
+<ul>
+<li><strong><code>Label</code> is identity.</strong> The engine's table, the resolver's
+candidate-event dedup (<code>emitNewCandidates</code>), and the CLI's race rows are all keyed by
+<code>Label</code>. Labels follow fixed prefixes — <code>scion:</code>, <code>scitra:</code>, <code>v6:</code>/<code>v6hint:</code>,
+<code>v4:</code>/<code>v4hint:</code>, with <code>+tcp</code> inserted for TCP siblings and <code>#pN</code> appended by
+path expansion — and <code>cmd/hev3</code>'s <code>familyFromLabel</code> relies on exactly these prefixes.</li>
+<li><strong><code>GroupALPN</code> vs <code>ALPN</code>.</strong> <code>ALPN</code> is what the dialer offers
+(<code>["h3"]</code> for a QUIC leg; supported-minus-h3 for its TCP sibling). <code>GroupALPN</code> is the
+covering record's <em>full</em> supported set and is the §5.1 grouping key in <code>Sort</code> — it keeps a
+record's QUIC and TCP candidates in the same group so racing is per-address QUIC-before-TCP, not
+all-QUIC-then-all-TCP. <code>nil</code> <code>GroupALPN</code> (legacy no-record and unassociated-trailing
+candidates) falls back to grouping by <code>ALPN</code>.</li>
+<li><strong><code>Policy</code></strong> is the client-side view of a <code>scion-policy</code> SvcParam
+(<code>PathPolicy</code>: ordered <code>Prefer</code> metrics — latency, bottleneck bandwidth, hops — plus
+optional <code>MaxLatency</code>/<code>MinBandwidthKbps</code> thresholds, zero = none). It travels on the
+proto-candidate and is consumed by <code>rankPaths</code>/<code>filterByPolicy</code> during expansion.</li>
+<li><strong><code>ViaScitra</code></strong> marks a SCION-derived candidate rewritten to a mapped IPv6 address;
+it is <code>FamilyIPv6</code> for sorting/interleave purposes but keeps <code>IA</code> and a
+<code>scitra:</code> label.</li>
+<li><strong><code>Path</code></strong> (<code>*SCIONPath</code>: fingerprint, summed advertised latency, hop count,
+and the pinned <code>snet.Path</code> stored as <code>any</code> so pure-logic files need no scionproto import)
+distinguishes a dialable per-path SCION candidate from a proto-candidate (<code>Path == nil</code>).
+"Any candidate anywhere has <code>Path != nil</code>" is also the signal (<code>hasNativeSCIONPath</code>) that
+native SCION exists, which flips the family-interleave preference in <code>Sort</code>.</li>
+</ul>
+
+<h2 id="resolver">4. resolver.go — DNS to candidates <span class="file">pkg/hev3/resolver.go</span></h2>
+
+<p><strong>Purpose.</strong> <code>ResolveHost(ctx, host, port, ResolveOptions)</code> turns one hostname into a
+stream of candidate sets. It launches a <em>dynamic</em> set of parallel queries — HTTPS and/or SVCB
+(per <code>RRType</code>), AAAA and A for the owner, and AAAA/A for every ServiceMode
+<code>TargetName</code> discovered along the way (RFC 9460 §4.2.1) — and returns
+<code>Resolved{Initial, Updates}</code>. Key internals: <code>resolveRun.run</code> (the event loop),
+<code>resolveService</code>/<code>resolveIPs</code> (per-query workers), <code>parseServiceRecord</code>/<code>svcRecord</code>
+(typed record view), <code>buildCandidates</code>/<code>recordCandidates</code> (candidate emission),
+<code>orderRecords</code> (§5.2 priority + shuffle).</p>
+
+<h3>The §4.2 release gate</h3>
+<p>The heart of <code>run</code> is the <code>release</code> closure, which decides when the current merged
+candidate set may be published:</p>
+<pre><code>allFinal := outstanding == 0
+if !allFinal {
+    if !positive() { return }
+    if !(ownerAAAAFinal() &amp;&amp; serviceFinal()) &amp;&amp; !delayElapsed { return }
+}</code></pre>
+<ul>
+<li><strong>Positive answer required</strong> — a final non-empty AAAA/A for <em>any</em> queried name, or a
+chosen service record carrying a <code>scion=</code> address or an ipv4/ipv6 hint. A SCION-only name
+therefore counts as positive without any address answer.</li>
+<li><strong>Set 1</strong> is "owner's AAAA final AND every queried service qtype final". A is
+never itself a gate requirement — only a possible source of positivity.</li>
+<li><strong>Timer arming</strong>: the Resolution Delay timer (default
+<code>defaultResolutionDelay</code> = 50ms) starts <em>disarmed</em> and is armed only at the <em>first
+positive answer</em> while set 1 is still unsatisfied — the draft starts the clock at the first
+positive response, not at query dispatch. Once it fires, <code>delayElapsed</code> lets the gate clear
+on positivity alone.</li>
+<li><strong>Unconditional release</strong>: when nothing is outstanding, release happens even with zero
+positive answers — an empty candidate set is a valid, immediate answer.</li>
+</ul>
+
+<h3>Record handling</h3>
+<ul>
+<li><strong>Multi-record ServiceMode + TargetName chase.</strong> Every ServiceMode record contributes
+candidates carrying its <em>own</em> ALPN/port/priority. A record whose <code>TargetName</code> names a
+not-yet-queried host spawns AAAA/A for it mid-flight, so <code>outstanding</code> grows dynamically.
+A TargetName shared by several records has its A/AAAA emitted only by the <em>first
+(lowest-priority)</em> covering record (the <code>emitted</code> map in <code>recordCandidates</code>); later
+records covering the same name re-emit only their own <code>scion=</code> addresses. Owner addresses no
+record targets trail the list as "unassociated" candidates at priority 65535.</li>
+<li><strong>AliasMode chase.</strong> <code>resolveService</code> follows AliasMode (SvcPriority 0) chains up to
+<code>maxAliasChase</code> = 4 steps, re-querying the <em>same</em> qtype; a present AliasMode record
+suppresses ServiceMode siblings (RFC 9460 §2.4.2). Loop/self-alias detection keys on
+<code>dns.CanonicalName</code> (case-insensitive, RFC 4343), and a TargetName of "." resolves against
+the name that <em>answered</em> (the chase end), not the original owner.</li>
+<li><strong>Mandatory rejection.</strong> <code>parseServiceRecord</code> rejects a record whose
+<code>mandatory=</code> lists any SvcParamKey outside <code>supportedParams</code> (RFC 9460 §8); the record is
+skipped with a one-time timeline note (<code>noteOnce</code>), naming the offending key in the error.</li>
+<li><strong>Effective ALPN → dual candidates.</strong> <code>svcRecord.supportedALPN</code> computes the record's
+effective set — its <code>alpn=</code> values plus the https default <code>http/1.1</code> unless
+<code>no-default-alpn</code> — intersected with <code>clientALPN</code> (<code>h3, h2, http/1.1</code>) in client
+preference order. Each IP address then emits up to <em>two</em> candidates: a QUIC candidate
+(<code>ALPN ["h3"]</code>) when h3 is supported and a TCP candidate (supported minus h3, label suffix
+<code>+tcp</code>) when anything else is — so a UDP-blackholed network still converges on h2/http1.1.
+A record whose effective set is empty contributes nothing at all (draft §6.2).</li>
+<li><strong>SCION requires QUIC.</strong> <code>scion=</code> addresses are emitted only when the record's set
+includes h3; otherwise each is dropped with a <code>"no QUIC ALPN in record; SCION transport is
+QUIC-only"</code> note.</li>
+<li><strong>Hint suppression.</strong> <code>ipv4hint</code>/<code>ipv6hint</code> stand in only when the
+corresponding family's real answer is <em>final and empty</em> (RFC 9460 §7.3) — a hint never
+overrides or supplements live A/AAAA data.</li>
+<li><strong>Equal-priority shuffle.</strong> <code>orderRecords</code> sorts records by SvcPriority and shuffles
+runs of equal priority (§5.2) with a <em>run-stable</em> RNG (seeded from <code>ShuffleSeed</code>, or 8
+bytes of <code>crypto/rand</code> per run). It is called exactly once per qtype so rebuilds never
+reshuffle — a reshuffle would emit spurious Updates.</li>
+<li><strong>RRType selection.</strong> <code>RRBoth</code> (default) queries HTTPS and SVCB in parallel and the
+<code>chosen</code> closure prefers the HTTPS answer's records when present — the migration default
+while deployed zones still use SVCB.</li>
+<li><strong>ISD-AS presentation.</strong> <code>scionIA</code> recomputes the canonical form from
+<code>ISD</code>/<code>ASN</code> instead of calling <code>addr.String()</code>: the forked dns module's wire
+pack/unpack loses the hex-vs-decimal presentation bit, so large ("SCION-only") ASNs are printed
+as three hex groups by rule (<code>ASN &gt; maxBGPAS</code>), keeping <code>Label</code> consistent with
+<code>IA</code> regardless of how the answer arrived.</li>
+</ul>
+
+<h3>Transport details</h3>
+<p><code>exchange</code>/<code>exchangeServers</code>: every query carries EDNS0 with a 1232-byte UDP size; a
+truncated UDP reply triggers one TCP retry against the same server, falling back to the truncated
+answer if TCP fails. Servers come from <code>resolverAddresses</code>: a comma-separated
+<code>Resolver</code> option is tried in order (failover), otherwise every nameserver in
+<code>/etc/resolv.conf</code>, IPv6 servers first (draft §4.5). <code>queryTimeout</code> = 2s bounds one
+per-server attempt, not the end-to-end exchange.</p>
+
+<h3>The Resolved contract</h3>
+<div class="invariant"><strong>Drain or cancel.</strong> <code>Updates</code> delivers <em>complete</em> candidate
+sets — each send replaces, never appends — and is closed when nothing is outstanding. A caller must
+keep draining <code>Updates</code> until it closes, or cancel ctx: the internal goroutine blocks sending a
+merged result with only a <code>ctx.Done()</code> escape, so an abandoned channel whose ctx never ends
+delays cleanup until the ctx's own deadline. <code>Resolved.MinTTL</code> reports the smallest TTL among
+contributing answers (via <code>captureTTL</code>, atomically min-tracked) — the natural cache lifetime for
+the set; zero until a positive answer.</div>
+
+<h2 id="engine">5. engine.go — the connection engine <span class="file">pkg/hev3/engine.go</span></h2>
+
+<p><strong>Purpose.</strong> <code>runEngine(ctx, engineConfig)</code> is the §4–§7 scheduler: one goroutine
+(<code>engine.loop</code>) owning the candidate table, the sorted <code>pending</code> list, and both timers.
+<code>engineConfig</code>'s zero-value fields disable features (nil <code>updates</code> ⇒ static set; nil
+<code>sortFn</code> ⇒ insertion order; nil <code>filter</code> ⇒ accept all; nil <code>isProto</code>/<code>expand</code> ⇒
+no expansion interception), which is exactly how <code>Race</code> degenerates it.</p>
+
+<h3>Ingest and resort (§4.3/§7 merge)</h3>
+<ul>
+<li><code>ingest(set)</code> merges one complete set: filtered candidates are dropped before anything else;
+known labels keep their status (first ingest wins); proto candidates
+(<code>isProto</code>) get a <code>candExpanding</code> entry and one expander goroutine; everything else
+enters as <code>candNew</code>.</li>
+<li><strong>Tombstones.</strong> In dynamic mode (updates non-nil), labels still <code>candNew</code> whose label —
+or, for expanded children, whose <em>parent proto label</em> — is missing from the set are marked
+<code>candDone</code>: never launched, never will be (§7: started attempts are never cancelled by a DNS
+change). An <em>empty</em> update set legitimately tombstones every unlaunched candidate (a late
+no-supported-ALPN record can revoke the whole set, draft §6.2). Tombstones are permanent: ingest
+skips known labels, so a re-added label never resurrects, and a re-added proto parent never
+re-expands.</li>
+<li><code>resort()</code> rebuilds <code>pending</code>: the sort function sees the <em>complete</em> live list
+(all statuses except proto placeholders and tombstones) so a late arrival is positioned as if
+present from the start; <code>pending</code> is then the sorted order filtered to <code>candNew</code>.</li>
+</ul>
+
+<h3>Memoized async expansion</h3>
+<p>The <code>candExpanding</code> table entry does double duty: it memoizes the label — a re-send of the
+same proto by a later update finds the entry and never re-expands, which keeps Timeline drop-notes
+single (the guarantee the deleted <code>expandCached</code> helper used to provide) — and it gives §7
+child-removal a parent to test membership against. Expander goroutines dial against
+<code>e.expandCtx</code>, cancelled the instant <code>loop</code> returns on any path, so an expander can neither
+outlive the engine nor block writing to the buffer-8 <code>expandResults</code> channel after nobody reads
+it. When a result arrives, children are ingested <em>without re-filtering</em> (see the invariants
+section) and the parent flips to <code>candExpanded</code>. A proto tombstoned <em>while</em> its expansion
+was in flight still gets its children ingested — self-healing rather than a bug, because the
+resolver always re-sends complete sets and the next update's §7 pass re-tombstones those children.</p>
+
+<h3>Stagger timer discipline</h3>
+<p>Both timers use the disarmed-start pattern (<code>NewTimer(hour)</code>, immediate <code>Stop</code> +
+drain), with <code>arm</code>/<code>disarm</code> helpers that drain the channel to prevent stale ticks.
+<code>launchNext</code> pops the pending head, launches it, and arms the stagger for the next candidate
+with <code>nextDelay</code> — or disarms when pending is empty. Two re-arm paths exist for "fresh
+candidates entered pending while no stagger clock is ticking": one after <code>expandResults</code>
+ingestion and one after an <code>updates</code> ingestion. Both distinguish <code>inflight == 0</code> (nothing
+to stagger against — launch immediately; the expansion path also covers <code>lastLaunched == ""</code>,
+the proto-only-initial-set case where nothing was ever launched) from "an attempt is in flight but
+the timer was disarmed" (a §4.3 update emptied pending under an armed timer; re-arm relative to now
+so new arrivals launch within one normal interval instead of being stranded until the in-flight
+attempt finishes).</p>
+
+<h3>Adaptive delay</h3>
+<pre><code>// nextDelay: clamp(2·Latency + 60ms, minDelay, base)
+d := e.cfg.delay
+if e.cfg.adaptive &amp;&amp; c.Family == FamilySCION &amp;&amp; c.Path != nil &amp;&amp; c.Path.Latency &gt; 0 {
+    if a := 2*c.Path.Latency + 60*time.Millisecond; a &lt; d {
+        d = a
+        if d &lt; e.cfg.minDelay { d = e.cfg.minDelay }
+    }
+}
+if d &gt; e.cfg.delay { d = e.cfg.delay } // final re-cap</code></pre>
+<p>After launching a SCION per-path candidate with known latency <em>L</em>, the next stagger tightens
+to <code>clamp(2L+60ms, minDelay, base)</code> — the shortcut can only shorten the base stagger, never
+lengthen it; the final re-cap guarantees that even a misconfigured <code>minDelay</code> above base cannot
+drag the next attempt out. <code>runEngine</code>'s defaulting establishes the bounds first:
+base delay ≤0 ⇒ 250ms, min ≤0 ⇒ 100ms, max ≤0 ⇒ 2s, and <em>everything</em> is hard-floored at
+<code>minAttemptDelayFloor</code> = 10ms (the draft §6 MUST — an explicit sub-10ms cap cannot defeat the
+floor) with the base capped at max.</p>
+
+<h3>SCION grace (Expansion Delay)</h3>
+<p><code>holdForGrace(lbl)</code> gates a launch when: grace is configured (<code>scionGrace &gt; 0</code>),
+the window hasn't closed (<code>!graceOver</code>), at least one expansion is in flight
+(<code>expanding &gt; 0</code>), and the pending head is not itself SCION. SCION children never wait, and
+scitra children can't be held either — they only exist after their parent's expansion completes,
+which drops <code>expanding</code> to zero and with it the gate. When the gate holds, the head stays in
+pending, the grace timer is armed once, and the stagger stays disarmed. Release is one of two paths:
+expansion completing (the <code>expandResults</code> case closes the window when <code>expanding == 0</code> and
+drains the backstop timer so a stale tick can't fire late) or the grace expiring
+(<code>graceTimer.C</code> sets <code>graceOver</code>). <code>graceOver</code> is <strong>one-way</strong>:
+once set, <code>holdForGrace</code> is inert for the rest of the run. This implements the algorithm
+draft's optional "Expansion Delay", surfaced as the CLI's <code>-scion-grace</code> knob.</p>
+
+<h3>Terminal conditions</h3>
+<ul>
+<li><strong>Success</strong>: first error-free <code>attemptResult</code> ⇒ <code>finish</code>: timeline
+<code>success</code>+<code>winner</code>, cancel every other in-flight attempt (timeline <code>cancel</code>),
+spawn <code>drainClose</code> to reap straggler results (a connection that won its dial after losing the
+race gets closed, not leaked), and wrap the winner in <code>withCancelOnClose</code> so its dial-context
+cancel is deferred until the caller closes the connection.</li>
+<li><strong>Failure</strong>: the loop's guard — <code>inflight == 0 &amp;&amp; len(pending) == 0 &amp;&amp;
+sourcesDone()</code>, where <code>sourcesDone</code> is "updates closed and no expansion in flight" —
+returns <code>failure()</code>: joined per-label errors in insertion order
+(<code>"hev3: all N candidates failed: …"</code>), or the caller's <code>noCandsErr</code> when nothing was
+ever attempted.</li>
+<li><strong>Fail-and-promote</strong> (§6): a failing attempt that is the <em>most recently launched</em>
+one promotes the next pending candidate immediately (disarm + <code>launchNext</code>).</li>
+<li><strong>ctx cancelled</strong>: cancel all in-flight, drain their results (in-flight can exceed the
+64-slot results buffer in dynamic mode, so the drain is required for goroutine hygiene), return
+<code>ctx.Err()</code>.</li>
+</ul>
+
+<h2 id="race">6. race.go — static-set wrapper <span class="file">pkg/hev3/race.go</span></h2>
+
+<p><code>Race(ctx, cands, dial, RaceOptions)</code> is a thin wrapper over <code>runEngine</code> with every
+dynamic feature off: no <code>updates</code>, no <code>sortFn</code> (attempts start in list order — the caller
+has already sorted), no <code>filter</code>, no <code>isProto</code>/<code>expand</code>. It pre-checks the empty list
+(<code>"hev3: no candidates to race"</code>) and passes the delay knobs through. What it pins is
+behavioral parity: the §6 semantics (stagger, most-recent-failure promotion, first success cancels
+the rest, straggler close, joined all-failed error) are identical whether the engine is driven
+statically by <code>Race</code> or dynamically by <code>Fetch</code> — <code>race_test.go</code> exercises those
+semantics against this entry point. This file also owns <code>defaultAttemptDelay</code> (250ms) and the
+core dial types: <code>Established{Cand, RT, Close, ALPN}</code> and
+<code>DialFunc</code>.</p>
+
+<h2 id="sort">7. sort.go + rfc6724.go — ordering <span class="file">pkg/hev3/sort.go, pkg/hev3/rfc6724.go</span></h2>
+
+<p><strong>Purpose.</strong> <code>Sort(cands, nativeSCION, preferredFamilyCount)</code> implements draft §5
+extended to three families. The stages, in order:</p>
+
+<ol>
+<li><strong>Group by ALPN set</strong> (<code>groupByALPN</code>): candidates whose ALPN slice is set-equal
+(order/duplicates ignored) share a group, keyed off <code>GroupALPN</code> when present so one record's
+QUIC and TCP siblings stay together (see §3). Groups sort ascending by their best (lowest) member
+<code>Priority</code>, first-seen order breaking ties.</li>
+<li><strong>Within each group, bucket by family.</strong> The SCION bucket sorts by §5.1 Priority only,
+<em>stably</em> — stability is what preserves the path-rank order (<code>#p1</code> before <code>#p2</code>)
+that <code>ExpandSCION</code> produced. IP buckets go through <code>sortIPBucket</code>.</li>
+<li><strong>Family interleave</strong> (<code>sortGroup</code>): with native SCION
+(<code>nativeSCION</code> = any candidate carries a pinned <code>Path</code>; scitra legs don't count) the
+preference order is SCION, IPv6, IPv4; without it, IPv6 then IPv4, with any stray
+<code>FamilySCION</code> candidate appended last rather than interleaved. Per round the preferred family
+takes <code>preferredFamilyCount</code> picks (the CLI's <code>-pfc</code>), every other family exactly one —
+RFC 8305 §4's interleave generalized to N families. ViaScitra candidates are
+<code>FamilyIPv6</code> and interleave normally.</li>
+</ol>
+
+<h3>sortIPBucket — a five-level strict weak ordering</h3>
+<p>One comparator, fully lexicographic, each level a total preorder so the composition satisfies
+<code>sort.SliceStable</code>'s strict-weak-ordering contract:</p>
+<ol>
+<li><strong>(a)</strong> ascending <code>Priority</code> (§5.1);</li>
+<li><strong>(b)</strong> scitra legs after real ones — <em>before</em> the RFC 6724 comparison, a
+reviewed subtlety: a translator leg must never beat a genuine IPv6 address on 6724 grounds;</li>
+<li><strong>(c)</strong> RFC 6724 §6 order between distinct addresses (§5.3 MUST);</li>
+<li><strong>(d)</strong> same-<code>Host</code> candidates grouped contiguously in first-seen order — this
+level exists to make address-equality itself an ordered level; an earlier version that applied (e)
+only "when hosts are equal" produced an intransitive relation (a1-h3 ~ a2-h3 and a2-h3 ~ a1-tcp yet
+a1-h3 &lt; a1-tcp) and could corrupt the sort;</li>
+<li><strong>(e)</strong> same address: QUIC (offers h3) before TCP.</li>
+</ol>
+
+<p><strong>rfc6724.go</strong> implements the subset of RFC 6724 §6 destination-address selection that
+§5.3 requires: rules 1 (reachable first), 2 (matching scope), 6 (higher precedence, via the §2.1
+default policy table), 8 (smaller scope) and 9 (longest common prefix with the chosen source),
+composed in <code>rfc6724Cmp</code> over per-address <code>rfc6724Key</code>s. Rules 3–5, 7 and 10 need
+per-interface state the library doesn't track; rule 10 (leave order) is the stable-sort fallback.
+The source address for rules 1/2/9 comes from <code>udpSource</code> — the connected-UDP trick (dial UDP
+to dst:53; no packets leave the host; the kernel picks the source) — a package <code>var</code> so tests
+inject fixed sources. Unparseable hosts get the zero key: a stable fallback.</p>
+
+<h2 id="dial-scion">8. dial_scion.go — expansion &amp; native dial <span class="file">pkg/hev3/dial_scion.go</span></h2>
+
+<h3>ExpandSCION</h3>
+<p><code>ExpandSCION(ctx, cands, DialerOptions)</code> turns proto-candidates
+(<code>FamilySCION, Path == nil, !ViaScitra</code>) into dialable ones; everything else passes through
+unchanged. Three outcomes per proto:</p>
+<ul>
+<li><strong>Live daemon</strong> ⇒ <code>expandOne</code>: parse the IA, query paths, apply
+<code>filterByPolicy</code> then <code>rankPaths</code>, truncate to K (default <code>defaultK</code> = 3), and emit
+per-path candidates labelled <code>&lt;parent&gt;#p1..#pK</code>, each with a pinned
+<code>SCIONPath{Fingerprint, Latency, Hops, SNET}</code> where <code>Latency</code> is
+<code>knownLatency</code> — the sum of non-negative advertised per-hop latencies.</li>
+<li><strong>No daemon</strong> (querier resolution failed) ⇒ <code>fallbackNoDaemon</code>: if
+<code>scitraAvailable()</code>, each proto becomes one <code>ViaScitra</code> candidate
+(<code>scitraCandidate</code>: FamilyIPv6, host rewritten via <code>ScitraMap</code>, label
+<code>scitra:&lt;IA&gt;,&lt;mapped&gt;</code>); otherwise dropped with a <code>"no SCION daemon and no scitra
+route"</code> timeline note.</li>
+<li><strong>Daemon present but no usable paths</strong> (parse failure, path-lookup error, zero paths)
+⇒ dropped with a note — scitra is strictly the <em>no-daemon</em> fallback and does not apply here.</li>
+</ul>
+
+<h3>Path ranking and scion-policy</h3>
+<p><code>pathKeyOf</code> projects each path's metadata into a <code>pathKey</code>: summed latency
+(<code>latUnset</code> if any hop is negative/unset), <strong>bottleneck bandwidth</strong> — the
+<em>minimum</em> announced hop bandwidth, with a zero hop or an empty list marking it unset — hop
+count, and fingerprint. <code>metricCmp</code> compares one metric with "missing sorts last" semantics;
+bandwidth is better when larger. <code>rankPaths</code> orders by the policy's <code>Prefer</code> list
+(default latency-then-hops), appends the default metrics not already named as trailing tie-breaks,
+and uses the fingerprint as the deterministic last resort. <code>filterByPolicy</code> drops paths that
+<em>provably</em> violate a threshold (a path missing the metric can't violate it); if every path
+violates, the thresholds are ignored entirely — the draft's fail-open MUST — and the caller leaves
+a <code>"…ignored (fail-open)"</code> note.</p>
+
+<h3>scionContext — shared daemon state</h3>
+<p>A <code>scionContext</code> (created per-Fetch by <code>newSCIONContext</code>, shared via
+<code>DialerOptions.SCION</code>) caches the sciond-derived state every SCION operation needs: one
+<code>pathQuerier</code> for expansion (<code>querier</code>) and one (connector, topology, local IP) triple for
+dials (<code>dialParams</code>) — resolved once instead of paying ~3 daemon RPCs per path attempt. The
+lifecycle details are deliberate:</p>
+<ul>
+<li><strong>Detached, bounded connects.</strong> Each resolution runs under
+<code>detachedConnectContext</code>: <code>context.WithoutCancel</code> + a 3s timeout
+(<code>scionContextConnectTimeout</code>). Rationale: a losing race attempt's cancelled ctx must not
+poison the shared connect for every other attempt; <code>WithoutCancel</code> strips <em>all</em>
+upstream cancellation (including Fetch's overall timeout), so the 3s bound is the only stop.</li>
+<li><strong>One-shot failure caching.</strong> <code>querier</code> and <code>dialParams</code> each resolve at
+most once (<code>sync.Once</code>) and cache failures for the context's lifetime — a transient daemon
+error on the first call disables native SCION for the rest of this Fetch (deliberate trade:
+correctness over one retry). <code>daemonAddr</code> is frozen at construction.</li>
+<li><strong>Close-safe by mutex, not Once.</strong> <code>Close</code> is guarded by a mutex plus a
+<code>closed</code> flag rather than its own <code>sync.Once</code>, because independent Once values have no
+happens-before relationship: a naive Close could run between a connection's RPCs completing and the
+result being stored, see nothing to close, and leak a live connection the Once then caches. With
+the mutex, whichever of Close vs. the Once body's final store observes <code>closed</code> second either
+reaps the just-produced connection (which then surfaces as <code>errSCIONContextClosed</code>) or has
+nothing left to reap.</li>
+</ul>
+
+<h3>dialSCION</h3>
+<p>Native h3 over SCION: get (connector, topology, localIP) — from the shared context when
+<code>o.SCION != nil</code> (never closing the shared connector), else inline with owned-connection
+cleanup on every error path — then build an <code>snet.SCIONNetwork</code> with an SCMP handler chain
+(<code>SCMPPropagationStopper</code> wrapping <code>DefaultSCMPHandler</code> with a daemon-backed
+<code>RevocationHandler</code>), <code>Listen</code> on an ephemeral UDP port, and dial
+<code>quic.Transport{Conn: snetConn}</code> directly. It deliberately does <em>not</em> use
+<code>pkg/snet/squic</code>: squic wraps the QUIC session as a single-stream <code>net.Conn</code> for
+control-plane RPC, whereas HTTP/3 needs the raw <code>*quic.Conn</code>. The remote
+<code>snet.UDPAddr</code> pins the dataplane path and underlay next hop from the candidate's ranked
+<code>snet.Path</code>.</p>
+
+<h2 id="dial-scitra">9. dial_scitra.go — the translator leg <span class="file">pkg/hev3/dial_scitra.go</span></h2>
+
+<p><code>ScitraMap(ia, host, prefix)</code> encodes a SCION address into its SCION-IP-translator mapped
+IPv6 address, bit-for-bit identical to the scitra CoreDNS plugin's <code>scion2ip</code>:</p>
+<pre><code>[0]      prefix (fc00::/8 by default — scitraPrefixDefault 0xfc)
+[1:5]    uint32 (ISD&lt;&lt;20)|asnEnc, big-endian; asnEnc = raw ASN when ASN &lt; 2^19,
+         or (1&lt;&lt;19)|(ASN&amp;0x7ffff) for the range 0x2_0000_0000..0x2_0007_ffff;
+         any other ASN is unmappable (error). ISD must fit 12 bits.
+[5:8]    local prefix / subnet ID — always zero here (plugin TODO defaults)
+[8:16]   host: IPv4 as 0x0000ffff‖v4, IPv6 as the low 8 bytes of the v6</code></pre>
+<p><code>scitraAvailable()</code> decides whether the fallback exists at all: it scans the kernel IPv6
+routing table for an fc00::/8 entry — destination-field prefix <code>"fc"</code> with prefix length
+<code>"08"</code>. The table path is the package var <code>procNetIPv6Route</code>
+(<code>/proc/net/ipv6_route</code>), a seam tests point at a fixture; a missing/unreadable table reads
+as unavailable. <code>dialScitra</code> itself is trivially <code>dialIP</code>: by the time it runs,
+<code>ExpandSCION</code> has already rewritten <code>Host</code> to the mapped IPv6 literal and cleared the
+path, so it's an ordinary IP dial over the translator route.</p>
+
+<h2 id="dial-ip">10. dial_ip.go — dispatch &amp; IP dials <span class="file">pkg/hev3/dial_ip.go</span></h2>
+
+<p><code>NewDialer(DialerOptions)</code> returns the single <code>DialFunc</code> the engine launches, a
+three-way dispatch on the candidate:</p>
+<pre><code>switch {
+case c.ViaScitra:              return dialScitra(ctx, c, o)
+case c.Family == FamilySCION:  return dialSCION(ctx, c, o)
+default:                       return dialIP(ctx, c, o)
+}</code></pre>
+<p><code>dialIP</code> picks HTTP/3 (<code>dialH3IP</code>) when <code>offersH3(c.ALPN)</code>, else TCP+TLS
+(<code>dialTCP</code>). <code>dialH3IP</code> opens a fresh UDP socket, dials QUIC, and wraps the connection
+via <code>newH3Established</code> in an <code>http3.ClientConn</code> RoundTripper whose Close tears down
+client-conn, QUIC conn, h3 transport, and underlay in order. <code>dialTCP</code> does one TLS dial and
+returns either an <code>http2.Transport</code> client conn (negotiated <code>h2</code>) or
+<code>oneConnH1Transport</code> — an <code>http.Transport</code> whose <code>DialTLSContext</code> hands out the
+already-established conn exactly once and errors on any second concurrent demand (never expected
+for one winner). TLS configs are cloned per attempt: <code>h3TLSConfig</code> pins ALPN to
+<code>h3</code>; <code>tcpTLSConfig</code> takes the candidate's ALPN minus h3 (UDP-only), defaulting to
+<code>h2, http/1.1</code>.</p>
+
+<p><code>DialerOptions</code> carries the base <code>TLS</code> config, <code>DaemonAddr</code> (precedence in
+<code>daemonAddress</code>: option → <code>$SCION_DAEMON_ADDRESS</code> → <code>defaultDaemonAddr</code>
+127.0.0.1:30255), <code>K</code>, the <code>Timeline</code>, and <code>SCION *scionContext</code> — the shared
+daemon state; nil means per-call lazy behavior, which is what standalone library callers and older
+tests get.</p>
+
+<h2 id="timeline">11. timeline.go — the event bus <span class="file">pkg/hev3/timeline.go</span></h2>
+
+<p><code>Timeline</code> is a mutex-guarded append-only list of
+<code>Event{At, Kind, Label, Detail}</code>; the zero value is ready to use and the start time is set
+lazily by the first <code>Add</code>, so all timestamps are relative to the first recorded event.
+<code>Events()</code> returns a snapshot copy. Producers and kinds:</p>
+
+<div class="tablewrap"><table>
+<tr><th>Kind</th><th>Emitted by</th><th>Meaning</th></tr>
+<tr><td><code>query</code> / <code>answer</code></td><td>resolver <code>exchange</code></td><td>one DNS exchange started/settled; label = <code>"&lt;TYPE&gt; &lt;name&gt;"</code>; answer detail carries the error, if any</td></tr>
+<tr><td><code>candidate</code></td><td>resolver <code>emitNewCandidates</code></td><td>a label newly present in a released set (deduped across rebuilds by label)</td></tr>
+<tr><td><code>fail</code> (note)</td><td>resolver <code>noteOnce</code>, expansion <code>note</code></td><td>drop notes: unsupported mandatory key, no client-supported ALPN, SCION-without-QUIC, no paths, no daemon/scitra, policy fail-open</td></tr>
+<tr><td><code>attempt</code></td><td>engine <code>launch</code></td><td>a dial goroutine started for this label</td></tr>
+<tr><td><code>fail</code></td><td>engine results case</td><td>the labelled attempt returned an error (detail = error text)</td></tr>
+<tr><td><code>success</code> / <code>winner</code></td><td>engine <code>finish</code></td><td>the winning attempt (both fire for the same label)</td></tr>
+<tr><td><code>cancel</code></td><td>engine <code>finish</code></td><td>an in-flight loser was cancelled after the win</td></tr>
+</table></div>
+
+<p>The CLI consumes the timeline exclusively — <code>buildRaceRows</code> derives the entire race table
+from these events with no side-channel bookkeeping, and <code>--json</code> dumps them raw. Note that
+<code>fail</code> is deliberately overloaded: resolver/expansion drop-notes and genuine attempt failures
+share the kind and are distinguished by their labels' lifecycle (a drop-note's label never gets an
+<code>attempt</code>).</p>
+
+<h2 id="fetch">12. hev3.go — Fetch wiring <span class="file">pkg/hev3/hev3.go</span></h2>
+
+<p><code>Fetch(ctx, rawURL, Options)</code> glues everything together. In order:</p>
+<ol>
+<li><code>parseTarget</code>: https-only (hev3 speaks only h3/h2 over TLS), port defaulting to 443.</li>
+<li><code>ResolveHost</code> under a child <code>resolveCtx</code>. Its cancel is both deferred <em>and</em>
+called explicitly right after the engine returns a winner — the draft's §6 MAY: stop outstanding
+queries once the race is decided. Cancelling <code>resolveCtx</code> is also what unblocks the resolver
+goroutine if <code>Updates</code> still has unsent merges.</li>
+<li><code>buildTLSConfig</code>: one <code>tls.Config</code> shared by every leg, <code>ServerName</code> pinned to
+the URL hostname (so the demo CA's <code>*.scion</code> cert verifies identically on SCION, v6 and v4
+legs), roots from <code>Options.CAFile</code> or <code>defaultCAFile</code> (<code>/etc/hev3/ca.pem</code>) when it
+exists, else the system pool.</li>
+<li><code>newSCIONContext(dOpts)</code> with <code>defer sctx.Close()</code> registered <em>before</em>
+<code>defer est.Close()</code> — LIFO means the connection closes first, then the shared daemon
+connector: the winner's SCMP revocation handler references that connector, so the order matters.</li>
+<li><code>runEngine</code> with the full dynamic config: <code>sortFn</code> closes over
+<code>hasNativeSCIONPath(cs)</code> (recomputed per resort — native preference can flip mid-race when
+expansion lands) and the effective PFC; <code>isProto</code> is
+<code>FamilySCION &amp;&amp; Path == nil &amp;&amp; !ViaScitra</code>; <code>expand</code> wraps
+<code>ExpandSCION</code> one candidate at a time.</li>
+<li><code>getOverWinner</code>: one GET over <code>est.RT</code>, body capped at
+<code>maxBodyBytes</code> = 4096, status prefixed with the proto ("HTTP/2.0 200 OK").</li>
+</ol>
+
+<div class="invariant"><strong>Filter semantics — families only, children exempt.</strong> The
+<code>filter</code> closure implements <code>NoSCION</code>/<code>NoIP</code> against <em>resolved</em> candidates:
+<code>NoSCION</code> drops <code>FamilySCION</code>, <code>NoIP</code> drops everything else. It is applied by
+<code>ingest</code> to resolver-delivered candidates only — expanded children are never re-filtered. So
+under <code>NoIP</code>, a SCION proto's scitra child (which is <code>FamilyIPv6</code>) still races: the
+scitra leg is the SCION fallback, not an IP candidate. Children inherit the parent's verdict.</div>
+
+<p>Error shape: the engine's <code>noCandsErr</code> is the pre-built
+<code>"hev3: fetch: no candidates for &lt;host&gt;"</code>; Fetch detects it with <code>errors.Is</code> and
+returns it un-wrapped, so a no-candidates outcome is not mislabelled as a race failure
+(everything else gets the <code>"hev3: fetch: race:"</code> prefix).</p>
+
+<h2 id="cli">13. cmd/hev3 — the CLI <span class="file">cmd/hev3/main.go</span></h2>
+
+<p>A flag-parse → <code>hev3.Fetch</code> → print pipeline (<code>run</code> is testable: args + stdout/stderr
+in, exit code out). Flags map 1:1 onto <code>hev3.Options</code>:</p>
+
+<div class="tablewrap"><table>
+<tr><th>Flag</th><th>Maps to</th><th>Notes</th></tr>
+<tr><td><code>-resolver</code></td><td><code>Resolver</code></td><td>"ip:port"; empty = /etc/resolv.conf</td></tr>
+<tr><td><code>-rr-type</code></td><td><code>RRType</code></td><td><code>https</code> | <code>svcb</code> | <code>both</code> (default; prefers HTTPS answers)</td></tr>
+<tr><td><code>-k</code></td><td><code>K</code></td><td>ranked SCION paths per candidate (0 = library default 3)</td></tr>
+<tr><td><code>-pfc</code></td><td><code>PreferredFamilyCount</code></td><td>interleave width; rejected if &lt; 1</td></tr>
+<tr><td><code>-no-scion</code> / <code>-no-ip</code></td><td><code>NoSCION</code>/<code>NoIP</code></td><td>family filters (children exempt, §12)</td></tr>
+<tr><td><code>-attempt-delay</code>, <code>-min-attempt-delay</code>, <code>-max-attempt-delay</code></td><td>delay knobs</td><td>sub-10ms values only produce a stderr warning here — the actual clamping lives in <code>runEngine</code></td></tr>
+<tr><td><code>-no-adaptive-delay</code></td><td><code>NoAdaptiveDelay</code></td><td>disables the 2L+60ms shortcut</td></tr>
+<tr><td><code>-scion-grace</code></td><td><code>SCIONGrace</code></td><td>the Expansion Delay demo knob; 0 = off</td></tr>
+<tr><td><code>-resolution-delay</code></td><td><code>ResolutionDelay</code></td><td>§4.2 gate (default 50ms)</td></tr>
+<tr><td><code>-insecure</code>, <code>-ca</code></td><td><code>Insecure</code>/<code>CAFile</code></td><td>TLS trust</td></tr>
+<tr><td><code>-json</code>, <code>-timeout</code></td><td>—</td><td>output mode; overall ctx deadline (default 15s)</td></tr>
+</table></div>
+
+<p><strong>buildRaceRows quirks.</strong> The human race table is derived purely from Timeline events: a
+label first seen via <code>candidate</code> with no later <code>attempt</code> renders "never-started";
+otherwise outcome/timing come from <code>attempt</code> plus whichever of
+<code>success</code>/<code>fail</code>/<code>cancel</code> (and <code>winner</code>) follows. The one post-processing
+pass is <code>suppressExpandedProtoRows</code>: every SCION proto gets a <code>candidate</code> event under
+its un-suffixed label, but attempts only ever fire on the expanded <code>#pN</code> children — without
+suppression the parent would sit forever as a misleading "never-started" ghost row next to its own
+children. The rule is precise: drop a never-started, outcome-less row only when some
+<em>started</em> row's label extends it with <code>#p</code>; a genuinely unreachable candidate keeps its
+row. <code>familyFromLabel</code> maps label prefixes back to family names for display
+(<code>scitra:</code> → "SCION(scitra)"). Both binaries also set
+<code>QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING</code> — snet conns are not <code>*net.UDPConn</code>, so
+quic-go's receive-buffer warning is unavoidable noise.</p>
+
+<h2 id="server">14. cmd/hev3-server — demo target <span class="file">cmd/hev3-server/main.go, listen.go, scion.go, handler.go</span></h2>
+
+<p><strong>Purpose.</strong> Serve the same tiny handler over every transport hev3 can win on — h2/http1.1
+over TCP+TLS, h3 over IP QUIC, optional cleartext :80, and (with <code>-scion</code>) native h3 over
+dispatcherless SCION QUIC — tagging each response with the transport (and, for SCION, the peer
+ISD-AS) that delivered the request.</p>
+
+<p><strong>The server struct pattern</strong> (<code>main.go</code>): each listener is a
+<code>server{name, serve, shutdown}</code>; constructors bind <em>synchronously</em> so the caller logs
+"listening" only after a real successful bind; <code>serveAll</code> runs every serve loop, waits for
+SIGINT/SIGTERM or a fatal serve error (ignoring <code>http.ErrServerClosed</code>/<code>quic.ErrServerClosed</code>),
+then shuts everything down with a 5s grace.</p>
+
+<p><strong>SCION-first setup and the ip-h3 exclusion logic</strong> (<code>listen.go</code>,
+<code>ipH3Addrs</code>). SCION is set up first because its bound underlay IP is the one address the ip-h3
+UDP listeners must avoid. Why: dispatcherless SCION pins the underlay UDP port to the fixed SCION
+port (the zone's SVCB <code>port=443</code> applies to the SCION leg — not negotiable), and Linux refuses
+a wildcard UDP bind and a specific-address UDP bind sharing one port unless both set
+SO_REUSEADDR — which the snet PacketConn does not. So in SCION mode with a wildcard
+<code>-listen-ip</code> host, <code>ipH3Addrs</code> enumerates the host's addresses (loopback + global
+unicast; skipping the SCION underlay IP, link-local, and everything in <code>-listen-exclude</code> —
+e.g. the mgmt IP scitra's port-forwarding binds) and <code>buildH3IPServer</code> binds one UDP listener
+per remaining address, all served by one shared <code>http3.Server</code> so a single Shutdown closes
+them all. An <em>explicit</em> non-wildcard <code>-listen-ip</code> host is honored as-is (erroring only if
+it <em>is</em> the SCION underlay address). The TCP listeners are unaffected — a wildcard TCP bind
+never collides with a UDP socket.</p>
+
+<p><strong>scionServer</strong> (<code>scion.go</code>) mirrors the client dial: sciond connect → topology →
+underlay IP (<code>scionLocalIP</code>: the <code>-scion-ip</code> flag wins, else sciond-derived; the flag
+exists because the testbed fabric puts the SCION listener on a sibling <code>.81</code> address so it
+can't collide with ip-h3 on <code>.80</code>) → <code>snet.Listen</code> → <code>quic.Transport</code> →
+<code>http3.Server.ServeListener</code>. <code>localAddr</code> reads the bound IP back from the actual
+<code>snet.Conn</code> rather than trusting the pre-bind lookup — the lookup is a hint, the socket is the
+truth. The request's remote address is the snet UDPAddr string, which is how the peer ISD-AS
+reaches the response body.</p>
+
+<p><strong>Handler transport tagging</strong> (<code>handler.go</code>): each listener wraps the shared mux in
+<code>withTransport(base, h)</code>, stashing <code>"scion"</code>, <code>"ip-h3"</code>, or <code>"ip"</code> in the
+request context; <code>transportTag</code> reads it back and refines the <code>"ip"</code> placeholder into
+<code>ip-h2</code>/<code>ip-http/1.1</code> from the negotiated TLS ALPN, since one TCP listener serves both.
+<code>GET /</code> returns a plain-text "reached over &lt;transport&gt;" summary; <code>GET /whoami</code>
+returns the same as JSON plus the request path.</p>
+
+<h2 id="cross-cutting">15. Cross-cutting concerns</h2>
+
+<h3 id="seams">15.1 Test seams</h3>
+<p>Unit tests run with no daemon and no network. Every external dependency sits behind an
+injectable seam; keep new dependencies behind the same kind of seam.</p>
+
+<div class="tablewrap"><table>
+<tr><th>Seam</th><th>Where</th><th>Kind</th><th>What tests do with it</th></tr>
+<tr><td><code>resolveQuerier</code></td><td>dial_scion.go</td><td>package <code>var</code></td><td>swap in a <code>fakeQuerier</code> or return an error to force the daemon-absent (scitra/drop) branch; also used to count connects through one <code>scionContext</code> and to block mid-Once for the Close-race tests</td></tr>
+<tr><td><code>pathQuerier</code></td><td>dial_scion.go</td><td>interface</td><td><code>fakeQuerier</code> returns synthetic <code>snet.Path</code> fixtures with crafted latency/bandwidth/hop metadata for ranking and policy tests</td></tr>
+<tr><td><code>procNetIPv6Route</code></td><td>dial_scitra.go</td><td>package <code>var</code> (file path)</td><td>point <code>scitraAvailable</code> at a fixture file with/without the fc00::/8 line</td></tr>
+<tr><td><code>udpSource</code></td><td>rfc6724.go</td><td>package <code>var</code> (func)</td><td>return fixed source addresses so RFC 6724 rules 1/2/9 are deterministic</td></tr>
+<tr><td><code>fakeDNS</code></td><td>resolver_test.go</td><td>in-process nameserver</td><td>per-(qtype,qname) RR map plus per-query <em>delays</em> and UDP <em>truncation</em> switches — how the §4.2 gate timing, TC→TCP retry, and multi-server failover are exercised against a real UDP/TCP listener on loopback</td></tr>
+<tr><td><code>ctl</code> / <code>fakeDialer</code></td><td>race_test.go</td><td>per-label dial controller</td><td>a <code>DialFunc</code> backed by a map of per-label channels: tests decide exactly when each attempt succeeds/fails, pinning stagger, promotion, cancel and straggler-close behavior</td></tr>
+<tr><td><code>addrs func() ([]net.Addr, error)</code></td><td>cmd/hev3-server/listen.go</td><td>parameter</td><td>synthetic interface lists for the <code>ipH3Addrs</code> enumeration/exclusion tests</td></tr>
+</table></div>
+
+<h3 id="forks">15.2 Forked dependencies (load-bearing)</h3>
+<p><code>go.mod</code> replaces two modules; the code will not compile or parse SVCB records against the
+upstreams:</p>
+<ul>
+<li><code>github.com/miekg/dns</code> → <code>github.com/netsys-lab/dns-scion-svcb</code> — adds the typed
+<code>scion</code>/<code>scion-policy</code> SvcParamKeys the resolver consumes directly:
+<code>dns.SVCB_SCION</code>/<code>dns.SVCB_SCION_POLICY</code>, <code>dns.SVCBScion</code> (with
+<code>SCIONAddr</code> values), <code>dns.SVCBScionPolicy</code> (typed policy items). Upstream miekg/dns
+would surface these as opaque unknown params — <code>parseServiceRecord</code>'s type switch and the
+whole SCION discovery path depend on the fork.</li>
+<li><code>github.com/scionproto/scion</code> → <code>github.com/lschulz/scion</code> — the snet/squic fork
+used for dispatcherless SCION QUIC; both the client dial (<code>dialSCION</code>) and the server
+listener (<code>scionServer</code>) build on its <code>snet.SCIONNetwork</code>/<code>quic.Transport</code>
+integration.</li>
+</ul>
+
+<h3 id="invariants">15.3 Load-bearing invariants</h3>
+<ul>
+<li><strong>Empty-check post-expansion (<code>sourcesDone</code>).</strong> "No candidates" is only decidable
+once <em>every</em> source is exhausted: the engine's terminal guard requires
+<code>inflight == 0 &amp;&amp; pending empty &amp;&amp; !updatesOpen &amp;&amp; expanding == 0</code>. An
+Initial set may legitimately be SCION-proto-only while A is still in flight — declaring failure any
+earlier would abort a race whose candidates simply haven't materialized yet.</li>
+<li><strong>Expansion is memoized per label.</strong> The proto's table entry
+(<code>candExpanding</code>/<code>candExpanded</code>) is the memo: a later update re-sending the same proto
+never re-expands, so Timeline drop-notes stay single and expansion work isn't duplicated across
+resolver batches.</li>
+<li><strong>The family filter never touches expanded children.</strong> <code>filter</code> runs in
+<code>ingest</code> against resolver-delivered candidates; <code>expandResults</code> ingestion deliberately
+skips it. <code>NoIP</code> must not kill the scitra (FamilyIPv6) child of a spared SCION proto.</li>
+<li><strong>Labels are stable identity.</strong> Table membership, tombstoning, timeline dedup, and CLI
+row-building all key on <code>Label</code>. Rename a label format and you silently break §7 merge
+semantics and the CLI's proto-row suppression (which depends on the <code>#p</code> suffix
+convention).</li>
+</ul>
+<div class="caveat"><strong>Known caveat — duplicate labels.</strong> A label encodes family, host (and the
+<code>+tcp</code>/<code>#pN</code>/hint variants) but <em>not</em> port or priority. Two ServiceMode records
+with different TargetNames that resolve to the same IP produce two candidates whose labels collide
+(e.g. both <code>v6:2001:db8::1</code>) even when their ports or priorities differ; the engine's
+first-wins ingest keeps the earlier one (the lower-priority record, since records are emitted in
+§5.2 order) and drops the later silently, and the resolver's timeline dedup likewise reports the
+label once. Harmless for the testbed zones, but worth knowing before reusing labels as a
+general-purpose key.</div>
+
+<h2 id="glossary">16. Glossary</h2>
+<dl class="gloss">
+<dt>proto-candidate</dt>
+<dd>A SCION candidate straight out of DNS: <code>FamilySCION</code>, <code>Path == nil</code>,
+<code>!ViaScitra</code>. Not dialable — a placeholder the engine hands to expansion instead of the
+pending list.</dd>
+<dt>per-path candidate</dt>
+<dd>A dialable SCION candidate produced by <code>ExpandSCION</code>: the proto plus one ranked, pinned
+<code>snet.Path</code>; labelled <code>&lt;parent&gt;#p1..#pK</code>. The draft term for the same thing.</dd>
+<dt>scitra leg</dt>
+<dd>The SCION-IP-translator fallback: a proto rewritten to its mapped IPv6 address
+(<code>ScitraMap</code>, fc00::/8), dialed as ordinary IPv6. Exists only when no daemon is reachable but
+an fc00::/8 route is. Counts as the SCION fallback, not an IP candidate, for filtering.</dd>
+<dt>Resolution Delay</dt>
+<dd>Draft §4.2: the bounded wait (default 50ms, timer armed at the first positive answer) for the
+owner's AAAA and the service RR answers before releasing Initial candidates built from what has
+arrived.</dd>
+<dt>Expansion Delay / SCION grace</dt>
+<dd>draft-john-scion-hev3's optional hold: keep IPv6/IPv4 launches back while SCION path expansion
+is in flight, up to a bound. Implemented as the engine's grace gate
+(<code>holdForGrace</code>/<code>graceOver</code>), surfaced as <code>-scion-grace</code>. Off by default.</dd>
+<dt>attempt delay / stagger</dt>
+<dd>Draft §6: the interval between successive connection-attempt launches. Base default 250ms,
+hard floor 10ms (MUST), cap 2s default.</dd>
+<dt>adaptive delay</dt>
+<dd>The engine's SCION shortcut: after launching a per-path candidate with known latency L, the
+next stagger is <code>clamp(2L+60ms, min, base)</code> — tighten, never lengthen.</dd>
+<dt>PFC (preferred family count)</dt>
+<dd><code>-pfc</code> / <code>PreferredFamilyCount</code>: how many candidates the preferred family gets per
+interleave round before each other family takes one.</dd>
+<dt>RRBoth / RRHTTPS / RRSVCB</dt>
+<dd>Which service-binding RR type(s) the resolver queries. <code>RRBoth</code> (default) queries HTTPS
+and SVCB in parallel and prefers the HTTPS answer — the migration default while deployed zones
+still use SVCB.</dd>
+<dt>tombstone</dt>
+<dd>An engine table entry marked <code>candDone</code> without ever launching: its label (or its proto
+parent) vanished from a later complete update set. Permanent within a run.</dd>
+<dt>fail-open</dt>
+<dd>The scion-policy rule: if thresholds would exclude <em>every</em> path, ignore the thresholds
+entirely rather than fail the candidate (draft MUST); noted on the timeline.</dd>
+<dt>dispatcherless SCION</dt>
+<dd>The lschulz/scion snet mode where the application's UDP socket <em>is</em> the SCION underlay —
+no dispatcher daemon multiplexes ports. Consequence: the underlay UDP port is pinned, which drives
+the server's ip-h3 bind-exclusion logic.</dd>
+<dt>sciond / daemon</dt>
+<dd>The local SCION daemon (default <code>127.0.0.1:30255</code>) that answers path queries and provides
+topology; its absence triggers the scitra fallback.</dd>
+<dt>ISD-AS / IA</dt>
+<dd>SCION's two-part AS identifier, e.g. <code>1-150</code>; ASNs above the 32-bit BGP space print as
+three 16-bit hex groups (<code>71-2:0:4a</code>).</dd>
+<dt>F-numbers (F8, F9, F12, …)</dt>
+<dd>Feature IDs from the local design specs, referenced in code comments (e.g. F9 = resolver
+failover, F10 = SCION-requires-QUIC, F12 = shared scionContext, F13 = adaptive delay). The specs
+live in gitignored <code>local-docs/</code>; the comments are self-explanatory without them.</dd>
+</dl>
+
+</main>
+</div>
+
+<script>
+(function () {
+  var links = document.querySelectorAll('nav.toc a');
+  var byId = {};
+  links.forEach(function (a) { byId[a.getAttribute('href').slice(1)] = a; });
+  var current = null;
+  var obs = new IntersectionObserver(function (entries) {
+    entries.forEach(function (en) {
+      if (en.isIntersecting && byId[en.target.id]) {
+        if (current) current.classList.remove('active');
+        current = byId[en.target.id];
+        current.classList.add('active');
+      }
+    });
+  }, { rootMargin: '0px 0px -70% 0px' });
+  document.querySelectorAll('main h1[id], main h2[id], main h3[id]').forEach(function (h) { obs.observe(h); });
+})();
+</script>
+</body>
+</html>
