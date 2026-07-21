@@ -1,6 +1,6 @@
 # scion-hev3
 
-Happy Eyeballs v3 for [SCION](https://scion-architecture.net/): a racing
+Happy Eyeballs v3 for SCION: a racing
 client library, CLI, and demo server that connect over native SCION and
 plain IPv6/IPv4 in parallel and use whichever wins. The companion IETF
 draft work that makes SCION endpoints discoverable through DNS lives in
