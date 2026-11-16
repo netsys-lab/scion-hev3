@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -28,18 +29,28 @@ const (
 // feature: nil updates ⇒ static set; nil sortFn ⇒ table insertion order;
 // nil filter ⇒ accept all; nil isProto/expand ⇒ no expansion interception.
 type engineConfig struct {
-	dial       DialFunc
-	initial    []Candidate
-	updates    <-chan []Candidate
-	sortFn     func([]Candidate) []Candidate
-	filter     func(Candidate) bool
-	isProto    func(Candidate) bool
-	expand     func(context.Context, Candidate) []Candidate
-	delay      time.Duration // effective base stagger (defaulted here if <= 0)
-	minDelay   time.Duration // adaptive-shortcut floor (defaulted/hard-floored here if <= 0)
-	maxDelay   time.Duration // cap on the base stagger (defaulted here if <= 0)
-	adaptive   bool          // enables the SCION path-latency shortcut in nextDelay
-	scionGrace time.Duration // hold non-SCION launches while any proto is candExpanding, up to this duration; 0 = disabled
+	dial    DialFunc
+	initial []Candidate
+	updates <-chan []Candidate
+	sortFn  func([]Candidate) []Candidate
+	filter  func(Candidate) bool
+	isProto func(Candidate) bool
+	expand  func(context.Context, Candidate) []Candidate
+	// register, if set, is called for each proto candidate in the order the
+	// candidates arrive, before its expansion starts.
+	register func(Candidate)
+	delay    time.Duration // effective base stagger (defaulted here if <= 0)
+	minDelay time.Duration // adaptive-shortcut floor (defaulted/hard-floored here if <= 0)
+	maxDelay time.Duration // cap on the base stagger (defaulted here if <= 0)
+	adaptive bool          // enables the SCION path-latency shortcut in nextDelay (not in the draft; opt-in)
+	// lookupWait: the first attempt to an IP endpoint is not started while
+	// the path lookup of a SCION endpoint that would precede it is in
+	// progress, until lookupWait (the Resolution Delay) after the first
+	// positive IP answer; <= 0 = lookups are not waited for.
+	lookupWait time.Duration
+	// ipAnswerAt reports when the first positive IP answer arrived (zero =
+	// none yet); nil or zero => the time the engine first saw an IP endpoint.
+	ipAnswerAt func() time.Time
 	tl         *Timeline
 	noCandsErr error // returned when every source closes with nothing to try
 }
@@ -92,23 +103,130 @@ type engine struct {
 	updatesOpen  bool
 	expanding    int // proto candidates handed to the expander, not yet returned
 
-	graceArmed bool // the SCION-grace timer has been Reset and not yet fired/drained
-	graceOver  bool // the SCION-grace window has closed — one-way; holdForGrace is inert thereafter
+	graceArmed bool // the lookup-wait timer has been Reset and not yet fired/drained
+	graceOver  bool // the lookup wait has ended - one-way; holdForGrace is inert thereafter
+	heldDue    bool // launchNext held the pending head: it is due as soon as the hold ends
+	ipLaunched bool // an attempt to an IP endpoint has started (lookups are waited for only before the first)
+	ipSeen     time.Time
+	lastStart  time.Time
+	prevStart  time.Time // lastStart before the most recent launch
+	// clock is the start of the most recent connection attempt, counting
+	// each attempt over a candidate path of a SCION endpoint. The engine and
+	// the SCION dials both start attempts only through it.
+	clock     attemptClock
+	clockAt   time.Time // the clock's reservation for the most recent launch
+	clockPrev time.Time // clock before that reservation
 }
 
-// holdForGrace reports whether the grace gate blocks launching lbl now:
-// grace configured and unexpired, at least one expansion in flight, and the
-// candidate is not itself SCION. SCION children never wait; scitra children
-// only exist after their parent's expansion completes, so once expanding hits
-// zero (which drops the gate) they cannot be held either.
+// attemptClock keeps the start of the most recent connection attempt so
+// that no two attempts start less than minAttemptDelayFloor apart, whether
+// they are attempts to endpoints started by the engine or attempts over the
+// further candidate paths of a SCION endpoint started by its dial.
+type attemptClock struct {
+	mu   sync.Mutex
+	last time.Time
+}
+
+// reserve records now as the start of an attempt and returns 0, or, if an
+// attempt started less than minAttemptDelayFloor ago, returns how long to
+// wait before trying again.
+func (c *attemptClock) reserve() time.Duration {
+	_, _, wait := c.reserveAt()
+	return wait
+}
+
+// reserveAt is reserve that also returns the reserved time and the start
+// time before it, for undo.
+func (c *attemptClock) reserveAt() (at, prev time.Time, wait time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
+	if !c.last.IsZero() {
+		if wait = minAttemptDelayFloor - now.Sub(c.last); wait > 0 {
+			return time.Time{}, c.last, wait
+		}
+	}
+	prev, c.last = c.last, now
+	return now, prev, 0
+}
+
+// record notes an attempt that started at t.
+func (c *attemptClock) record(t time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if t.After(c.last) {
+		c.last = t
+	}
+}
+
+// undo takes back the reservation made at at, restoring prev, unless an
+// attempt started after it.
+func (c *attemptClock) undo(at, prev time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.last.Equal(at) {
+		c.last = prev
+	}
+}
+
+// lookupDeadline is when waiting for path lookups ends: lookupWait after
+// the first positive IP answer.
+func (e *engine) lookupDeadline() time.Time {
+	t := e.ipSeen
+	if e.cfg.ipAnswerAt != nil {
+		if a := e.cfg.ipAnswerAt(); !a.IsZero() && (t.IsZero() || a.Before(t)) {
+			t = a
+		}
+	}
+	if t.IsZero() {
+		t = time.Now()
+	}
+	return t.Add(e.cfg.lookupWait)
+}
+
+// holdForGrace implements the wait for path lookups
+// (draft-john-scion-happy-eyeballs, "SCION Endpoints"): when the first
+// attempt to an IP endpoint would start and a path lookup is in progress
+// for a SCION endpoint that would precede it in the sorted list, hold it,
+// no longer than the Resolution Delay after the first positive IP answer.
+// Completion of those lookups ends the hold (holdForGrace turns false once
+// e.expanding drops or no expanding endpoint precedes the head).
 func (e *engine) holdForGrace(lbl string) bool {
-	if e.cfg.scionGrace <= 0 || e.graceOver {
+	if e.cfg.lookupWait <= 0 || e.graceOver || e.ipLaunched || e.expanding == 0 {
 		return false
 	}
-	if e.expanding == 0 {
+	head := e.table[lbl].cand
+	if head.Family == FamilySCION {
 		return false
 	}
-	return e.table[lbl].cand.Family != FamilySCION
+	if !time.Now().Before(e.lookupDeadline()) {
+		e.graceOver = true
+		return false
+	}
+	return e.expandingPrecedes(head)
+}
+
+// expandingPrecedes reports whether an endpoint whose path lookup is in
+// progress sorts before head when sorted together with the live candidates.
+func (e *engine) expandingPrecedes(head Candidate) bool {
+	if e.cfg.sortFn == nil {
+		return true
+	}
+	list := e.liveCandidates()
+	for _, lbl := range e.order {
+		if ent := e.table[lbl]; ent.status == candExpanding {
+			list = append(list, ent.cand)
+		}
+	}
+	for _, c := range e.cfg.sortFn(list) {
+		if c.Label == head.Label {
+			return false
+		}
+		if e.table[c.Label].status == candExpanding {
+			return true
+		}
+	}
+	return false
 }
 
 func runEngine(ctx context.Context, cfg engineConfig) (*Established, error) {
@@ -170,6 +288,9 @@ func (e *engine) ingest(set []Candidate) {
 			e.table[c.Label] = &tableEntry{cand: c, status: candExpanding}
 			e.order = append(e.order, c.Label)
 			e.expanding++
+			if e.cfg.register != nil {
+				e.cfg.register(c)
+			}
 			proto := c
 			go func() {
 				cands := e.cfg.expand(e.expandCtx, proto)
@@ -179,6 +300,9 @@ func (e *engine) ingest(set []Candidate) {
 				}
 			}()
 			continue
+		}
+		if c.Family != FamilySCION && e.ipSeen.IsZero() {
+			e.ipSeen = time.Now()
 		}
 		e.table[c.Label] = &tableEntry{cand: c, status: candNew}
 		e.order = append(e.order, c.Label)
@@ -217,17 +341,7 @@ func (e *engine) ingest(set []Candidate) {
 // it had been present from the start (§7); pending is then the sorted order
 // minus everything already launched.
 func (e *engine) resort() {
-	live := make([]Candidate, 0, len(e.order))
-	for _, lbl := range e.order {
-		ent := e.table[lbl]
-		if ent.status == candExpanding || ent.status == candExpanded {
-			continue // proto parents are placeholders, not dialable
-		}
-		if ent.status == candDone && ent.cancel == nil && ent.err == nil {
-			continue // §7 tombstone
-		}
-		live = append(live, ent.cand)
-	}
+	live := e.liveCandidates()
 	if e.cfg.sortFn != nil {
 		live = e.cfg.sortFn(live)
 	}
@@ -239,6 +353,23 @@ func (e *engine) resort() {
 	}
 }
 
+// liveCandidates lists every candidate that is or was dialable (all live
+// statuses), excluding proto placeholders and Sec 7 tombstones.
+func (e *engine) liveCandidates() []Candidate {
+	live := make([]Candidate, 0, len(e.order))
+	for _, lbl := range e.order {
+		ent := e.table[lbl]
+		if ent.status == candExpanding || ent.status == candExpanded {
+			continue // proto parents are placeholders, not dialable
+		}
+		if ent.status == candDone && ent.cancel == nil && ent.err == nil {
+			continue // §7 tombstone
+		}
+		live = append(live, ent.cand)
+	}
+	return live
+}
+
 func (e *engine) launch(ctx context.Context, lbl string) {
 	ent := e.table[lbl]
 	cctx, cancel := context.WithCancel(ctx)
@@ -246,10 +377,23 @@ func (e *engine) launch(ctx context.Context, lbl string) {
 	ent.cancel = cancel
 	e.inflight++
 	e.lastLaunched = lbl
+	e.prevStart = e.lastStart
+	e.lastStart = time.Now()
+	if ent.cand.Family != FamilySCION {
+		e.ipLaunched = true
+	}
 	if e.cfg.tl != nil {
 		e.cfg.tl.Add("attempt", lbl, "")
 	}
 	c := ent.cand
+	// The dialer sees the Connection Attempt Delay in use, so a racing
+	// SCION attempt can fit its path set into it.
+	cctx = withAttemptDelay(cctx, e.nextDelay(c))
+	// A SCION dial reports the start of each attempt over a candidate path,
+	// and starts an attempt over a further path only through the shared
+	// clock: no two attempts start within minAttemptDelayFloor.
+	cctx = withPathStartHook(cctx, e.clock.record)
+	cctx = withPathAttemptGate(cctx, e.clock.reserve)
 	go func() {
 		est, err := e.cfg.dial(cctx, c)
 		e.results <- attemptResult{c.Label, est, err}
@@ -324,7 +468,7 @@ func (e *engine) loop(ctx context.Context) (*Established, error) {
 	}
 	defer timer.Stop()
 
-	// graceTimer backs the optional SCION-grace hold (cfg.scionGrace): while a
+	// graceTimer backs the optional Expansion Delay hold (cfg.expansionDelay): while a
 	// proto expansion is in flight the gate holds non-SCION launches, and this
 	// timer is the backstop that releases them if expansion outlasts the grace.
 	// Same disarmed-start / drain discipline as the stagger timer above.
@@ -351,20 +495,31 @@ func (e *engine) loop(ctx context.Context) (*Established, error) {
 	launchNext := func() {
 		if len(e.pending) == 0 {
 			disarm()
+			e.heldDue = false
 			return
 		}
 		if e.holdForGrace(e.pending[0]) {
-			// SCION-grace hold: the head is a non-SCION leg and a proto is
+			// Expansion Delay hold: the head is a non-SCION leg and a proto is
 			// still expanding. Keep it in pending (do not pop), arm the grace
 			// timer once, and leave the stagger disarmed. The release paths —
 			// expansion completing (expandResults) or the grace expiring
 			// (graceTimer.C) — resume launching through this same closure.
 			if !e.graceArmed {
-				graceTimer.Reset(e.cfg.scionGrace)
+				graceTimer.Reset(time.Until(e.lookupDeadline()))
 				e.graceArmed = true
 			}
+			e.heldDue = true
 			return
 		}
+		e.heldDue = false
+		// No attempt starts within 10 ms of the previous one, also counting
+		// the attempts over the paths of a SCION endpoint.
+		at, prev, wait := e.clock.reserveAt()
+		if wait > 0 {
+			arm(wait)
+			return
+		}
+		e.clockAt, e.clockPrev = at, prev
 		lbl := e.pending[0]
 		e.pending = e.pending[1:]
 		e.launch(ctx, lbl)
@@ -372,6 +527,18 @@ func (e *engine) loop(ctx context.Context) (*Established, error) {
 			arm(e.nextDelay(e.table[lbl].cand))
 		} else {
 			disarm()
+		}
+	}
+
+	// rearm sets the stagger for candidates that entered pending while no
+	// stagger was running: the next attempt starts when the timer set by
+	// the most recent attempt would have fired, or at once if that has
+	// passed.
+	rearm := func() {
+		if d := e.nextDelay(e.table[e.lastLaunched].cand) - time.Since(e.lastStart); d > 0 {
+			arm(d)
+		} else {
+			launchNext()
 		}
 	}
 
@@ -444,10 +611,12 @@ func (e *engine) loop(ctx context.Context) (*Established, error) {
 			// already racing when a later IP head got held past the grace.
 			e.graceArmed = false
 			e.graceOver = true
-			if e.inflight == 0 && !timerArmed && len(e.pending) > 0 {
+			if e.heldDue {
+				launchNext()
+			} else if e.inflight == 0 && !timerArmed && len(e.pending) > 0 {
 				launchNext()
 			} else if !timerArmed && len(e.pending) > 0 {
-				arm(e.nextDelay(e.table[e.lastLaunched].cand))
+				rearm()
 			}
 
 		case res := <-e.results:
@@ -462,9 +631,16 @@ func (e *engine) loop(ctx context.Context) (*Established, error) {
 			if e.cfg.tl != nil {
 				e.cfg.tl.Add("fail", res.label, res.err.Error())
 			}
+			if res.label == e.lastLaunched && errors.Is(res.err, errNoEligiblePath) {
+				// The SCION endpoint had no eligible path: no attempt was
+				// started, so it does not count as one.
+				e.clock.undo(e.clockAt, e.clockPrev)
+				e.lastStart = e.prevStart
+			}
 			if res.label == e.lastLaunched && len(e.pending) > 0 {
-				// §6: most-recent attempt failed inside its stagger slot —
-				// promote the next candidate immediately.
+				// Sec 6: most-recent attempt failed inside its stagger slot -
+				// promote the next candidate without waiting for the timer
+				// (launchNext keeps the 10 ms between attempt starts).
 				disarm()
 				launchNext()
 			}
@@ -496,7 +672,12 @@ func (e *engine) loop(ctx context.Context) (*Established, error) {
 			e.resort()
 			// Mirrors the update-ingest re-arm below: fresh candidates just
 			// entered pending with no stagger clock ticking.
-			if !timerArmed && len(e.pending) > 0 {
+			if e.heldDue {
+				// The Expansion Delay held a due attempt: re-evaluate now
+				// (launches the new head, or holds again if another
+				// preceding lookup is still in progress).
+				launchNext()
+			} else if !timerArmed && len(e.pending) > 0 {
 				if e.inflight == 0 || e.lastLaunched == "" {
 					// Nothing running to stagger against — or nothing ever
 					// launched (a proto-only initial set whose children only
@@ -510,10 +691,10 @@ func (e *engine) loop(ctx context.Context) (*Established, error) {
 					// and disarmed). Re-arm relative to now so these children
 					// launch within one normal interval instead of being
 					// stranded until the in-flight attempt finishes.
-					arm(e.nextDelay(e.table[e.lastLaunched].cand))
+					rearm()
 				}
 			}
-			// SCION-grace: once no proto is still expanding, the gate can never
+			// Expansion Delay: once no proto is still expanding, the gate can never
 			// hold again — close the window (one-way) and drain the backstop
 			// timer so a stale tick cannot fire after the fact. The re-arm block
 			// above already resumed launching (children sorted first when
@@ -530,7 +711,9 @@ func (e *engine) loop(ctx context.Context) (*Established, error) {
 				continue
 			}
 			e.ingest(set)
-			if !timerArmed && len(e.pending) > 0 {
+			if e.heldDue {
+				launchNext()
+			} else if !timerArmed && len(e.pending) > 0 {
 				if e.inflight == 0 {
 					// Nothing running to stagger against (mirrors the §6
 					// fail-and-promote exception): start now.
@@ -545,11 +728,26 @@ func (e *engine) loop(ctx context.Context) (*Established, error) {
 					// in-flight attempt finishes, however long that takes.
 					// Re-arm the stagger relative to now so it launches
 					// within one normal interval instead of indefinitely.
-					arm(e.nextDelay(e.table[e.lastLaunched].cand))
+					rearm()
 				}
 			}
 		}
 	}
+}
+
+type attemptDelayKey struct{}
+
+// withAttemptDelay records in ctx the Connection Attempt Delay the engine
+// armed after starting this attempt.
+func withAttemptDelay(ctx context.Context, d time.Duration) context.Context {
+	return context.WithValue(ctx, attemptDelayKey{}, d)
+}
+
+// attemptDelayFrom returns the Connection Attempt Delay in use for this
+// attempt, or 0 if unknown.
+func attemptDelayFrom(ctx context.Context) time.Duration {
+	d, _ := ctx.Value(attemptDelayKey{}).(time.Duration)
+	return d
 }
 
 // updatesSrc returns the updates channel, or a nil channel (blocks forever)

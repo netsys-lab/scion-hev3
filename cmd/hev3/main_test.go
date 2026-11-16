@@ -130,19 +130,40 @@ func TestRun_EngineFlags(t *testing.T) {
 	if code := run(args, null, null); code != 1 {
 		t.Errorf("run(engine flags) = %d, want 1 (accepted, fetch fails fast)", code)
 	}
+	args = []string{"-adaptive-delay", "-resolver", "127.0.0.1:1", "-timeout", "1ms", "https://nosuch.invalid/"}
+	if code := run(args, null, null); code != 1 {
+		t.Errorf("run(-adaptive-delay) = %d, want 1 (accepted, fetch fails fast)", code)
+	}
 }
 
-// TestRun_SCIONGraceFlag verifies the -scion-grace Duration flag parses and is
-// plumbed through: a legal value reaches the same fast hermetic failure (exit 1,
-// flag accepted) as the other engine flags.
-func TestRun_SCIONGraceFlag(t *testing.T) {
+// TestRun_SCIONFlags verifies the SCION path racing and experiment flags
+// parse and are plumbed through (exit 1: accepted, fetch fails fast), and
+// that out-of-range values are rejected (exit 2).
+func TestRun_SCIONFlags(t *testing.T) {
 	null, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
 	if err != nil {
 		t.Fatalf("open devnull: %v", err)
 	}
 	defer null.Close()
-	args := []string{"-scion-grace", "150ms", "-resolver", "127.0.0.1:1", "-timeout", "1ms", "https://nosuch.invalid/"}
+	for _, pd := range []string{"auto", "30ms"} {
+		args := []string{"-path-delay", pd, "-daemon", "127.0.0.1:1", "-resolver", "127.0.0.1:1", "-timeout", "1ms", "https://nosuch.invalid/"}
+		if code := run(args, null, null); code != 1 {
+			t.Errorf("run(-path-delay %s) = %d, want 1", pd, code)
+		}
+	}
+	args := []string{"-k", "2", "-path-delay", "0", "-path-mode", "copy", "-path-attempt-delay", "100ms", "-family-order", "ip-first", "-linger", "-1ms", "-exp-corrupt-path", "1",
+		"-repeat", "2", "-stats", "-json", "-daemon", "127.0.0.1:1",
+		"-resolver", "127.0.0.1:1", "-timeout", "1ms", "https://nosuch.invalid/"}
 	if code := run(args, null, null); code != 1 {
-		t.Errorf("run(-scion-grace 150ms) = %d, want 1 (accepted, fetch fails fast)", code)
+		t.Errorf("run(scion flags) = %d, want 1 (accepted, fetch fails fast)", code)
+	}
+	args = []string{"-scion", "1-ff00:0:110,127.0.0.1:1", "-daemon", "127.0.0.1:1", "-timeout", "50ms", "https://example.test/"}
+	if code := run(args, null, null); code != 1 {
+		t.Errorf("run(-scion target, no daemon) = %d, want 1", code)
+	}
+	for _, bad := range [][]string{{"-k", "0"}, {"-repeat", "0"}, {"-exp-corrupt-path", "-1"}, {"-path-delay", "-1ms"}, {"-path-delay", "fast"}, {"-path-mode", "x"}, {"-family-order", "x"}} {
+		if code := run(append(bad, "https://web.scion/"), null, null); code != 2 {
+			t.Errorf("run(%v) = %d, want 2", bad, code)
+		}
 	}
 }

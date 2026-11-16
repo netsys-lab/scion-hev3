@@ -5,6 +5,7 @@ import (
 	rand "math/rand/v2"
 	"net"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -187,49 +188,6 @@ func TestParseServiceRecord_TargetName(t *testing.T) {
 	}
 }
 
-// scion-policy items convert into PathPolicy: order preserved, first
-// occurrence wins on duplicates, thresholds mapped to native units.
-func TestPathPolicyFrom(t *testing.T) {
-	rec, err := parseServiceRecord(mustSVCB(t,
-		`x. 300 IN SVCB 1 . alpn=h3 scion=1-150\\,10.20.3.215 scion-policy=bw,latency,maxlat=50ms,minbw=25M`), "x.")
-	if err != nil {
-		t.Fatalf("parseServiceRecord: %v", err)
-	}
-	p := rec.policy
-	if p == nil {
-		t.Fatalf("policy = nil, want parsed PathPolicy")
-	}
-	if want := []PolicyMetric{MetricBandwidth, MetricLatency}; !reflect.DeepEqual(p.Prefer, want) {
-		t.Errorf("Prefer = %v, want %v", p.Prefer, want)
-	}
-	if p.MaxLatency != 50*time.Millisecond {
-		t.Errorf("MaxLatency = %v, want 50ms", p.MaxLatency)
-	}
-	if p.MinBandwidthKbps != 25000 {
-		t.Errorf("MinBandwidthKbps = %d, want 25000", p.MinBandwidthKbps)
-	}
-}
-
-// Duplicate metrics and thresholds keep the FIRST occurrence (draft
-// wire-format rule).
-func TestPathPolicyFrom_DuplicatesKeepFirst(t *testing.T) {
-	rec, err := parseServiceRecord(mustSVCB(t,
-		`x. 300 IN SVCB 1 . alpn=h3 scion=1-150\\,10.20.3.215 scion-policy=latency,bw,latency,maxlat=50ms,maxlat=90ms`), "x.")
-	if err != nil {
-		t.Fatalf("parseServiceRecord: %v", err)
-	}
-	p := rec.policy
-	if p == nil {
-		t.Fatalf("policy = nil")
-	}
-	if want := []PolicyMetric{MetricLatency, MetricBandwidth}; !reflect.DeepEqual(p.Prefer, want) {
-		t.Errorf("Prefer = %v, want %v (duplicate latency dropped)", p.Prefer, want)
-	}
-	if p.MaxLatency != 50*time.Millisecond {
-		t.Errorf("MaxLatency = %v, want 50ms (first occurrence wins)", p.MaxLatency)
-	}
-}
-
 func drainUpdates(ch <-chan []Candidate, timeout time.Duration) ([][]Candidate, bool) {
 	var got [][]Candidate
 	deadline := time.After(timeout)
@@ -252,13 +210,13 @@ func drainUpdates(ch <-chan []Candidate, timeout time.Duration) ([][]Candidate, 
 func TestResolveHost_SVCBWithScionAndRealAnswers(t *testing.T) {
 	f := newFakeDNS(t)
 	f.set("web.scion.", dns.TypeSVCB, mustRR(t,
-		`web.scion. 300 IN SVCB 1 . alpn=h3 port=8443 ipv6hint=2001:db8::9 scion=1-150\\,10.20.3.215`))
+		`web.scion. 300 IN SVCB 1 . alpn=h3 port=8443 ipv6hint=2001:db8::9 scion=1-150_10.20.3.215`))
 	f.set("web.scion.", dns.TypeAAAA, mustRR(t, `web.scion. 300 IN AAAA 2001:db8::215`))
 	f.set("web.scion.", dns.TypeA, mustRR(t, `web.scion. 300 IN A 10.20.3.215`))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	res, err := ResolveHost(ctx, "web.scion", 443, ResolveOptions{Resolver: f.addr})
+	res, err := ResolveHost(ctx, "web.scion", 443, ResolveOptions{Resolver: f.addr, RRType: RRSVCB})
 	if err != nil {
 		t.Fatalf("ResolveHost: %v", err)
 	}
@@ -336,7 +294,7 @@ func TestResolveHost_ResolutionDelayGatesSVCB(t *testing.T) {
 	// candidate set, matching this test's pre-Task-7 shape exactly (h3 is
 	// also required for the SCION candidate to survive at all: F10, SCION
 	// transport is QUIC-only).
-	f.set("web.scion.", dns.TypeSVCB, mustRR(t, `web.scion. 300 IN SVCB 1 . alpn=h3 no-default-alpn scion=1-150\\,10.20.3.215`))
+	f.set("web.scion.", dns.TypeSVCB, mustRR(t, `web.scion. 300 IN SVCB 1 . alpn=h3 no-default-alpn scion=1-150_10.20.3.215`))
 	f.setDelay("web.scion.", dns.TypeSVCB, 80*time.Millisecond)
 	f.set("web.scion.", dns.TypeAAAA, mustRR(t, `web.scion. 300 IN AAAA 2001:db8::215`))
 	f.set("web.scion.", dns.TypeA, mustRR(t, `web.scion. 300 IN A 10.20.3.215`))
@@ -344,14 +302,14 @@ func TestResolveHost_ResolutionDelayGatesSVCB(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	start := time.Now()
-	res, err := ResolveHost(ctx, "web.scion", 443, ResolveOptions{Resolver: f.addr})
+	res, err := ResolveHost(ctx, "web.scion", 443, ResolveOptions{Resolver: f.addr, RRType: RRSVCB})
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("ResolveHost: %v", err)
 	}
 
-	if elapsed < 30*time.Millisecond || elapsed > 79*time.Millisecond {
-		t.Fatalf("Initial released after %v, want ~50ms (before the 80ms SVCB answer)", elapsed)
+	if elapsed < 15*time.Millisecond || elapsed > 79*time.Millisecond {
+		t.Fatalf("Initial released after %v, want ~25ms (before the 80ms SVCB answer)", elapsed)
 	}
 	if got := labels(res.Initial); len(got) != 2 {
 		t.Fatalf("Initial = %v, want exactly the AAAA/A candidates", got)
@@ -440,13 +398,13 @@ func TestResolveHost_NoSVCB(t *testing.T) {
 func TestResolveHost_AliasModeChase(t *testing.T) {
 	f := newFakeDNS(t)
 	f.set("alias.scion.", dns.TypeSVCB, mustRR(t, `alias.scion. 300 IN SVCB 0 target.scion.`))
-	f.set("target.scion.", dns.TypeSVCB, mustRR(t, `target.scion. 300 IN SVCB 1 . alpn=h3 scion=1-161\\,10.20.3.161`))
+	f.set("target.scion.", dns.TypeSVCB, mustRR(t, `target.scion. 300 IN SVCB 1 . alpn=h3 scion=1-161_10.20.3.161`))
 	f.set("alias.scion.", dns.TypeAAAA, mustRR(t, `alias.scion. 300 IN AAAA 2001:db8::161`))
 	f.set("alias.scion.", dns.TypeA, mustRR(t, `alias.scion. 300 IN A 10.20.3.161`))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	res, err := ResolveHost(ctx, "alias.scion", 443, ResolveOptions{Resolver: f.addr})
+	res, err := ResolveHost(ctx, "alias.scion", 443, ResolveOptions{Resolver: f.addr, RRType: RRSVCB})
 	if err != nil {
 		t.Fatalf("ResolveHost: %v", err)
 	}
@@ -490,7 +448,7 @@ func TestResolveHost_SVCBTimeoutNonFatal(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	start := time.Now()
-	res, err := ResolveHost(ctx, "unreachable.scion", 443, ResolveOptions{Resolver: f.addr})
+	res, err := ResolveHost(ctx, "unreachable.scion", 443, ResolveOptions{Resolver: f.addr, RRType: RRSVCB})
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("ResolveHost: %v", err)
@@ -518,7 +476,7 @@ func TestResolveHost_SVCBTimeoutNonFatal(t *testing.T) {
 func TestResolveHost_ReleasesWithoutAWhenSVCBAndAAAAComplete(t *testing.T) {
 	f := newFakeDNS(t)
 	f.set("early.scion.", dns.TypeSVCB, mustRR(t,
-		`early.scion. 300 IN SVCB 1 . alpn=h3 scion=1-150\\,10.20.3.215`))
+		`early.scion. 300 IN SVCB 1 . alpn=h3 scion=1-150_10.20.3.215`))
 	f.set("early.scion.", dns.TypeAAAA, mustRR(t, `early.scion. 300 IN AAAA 2001:db8::215`))
 	f.set("early.scion.", dns.TypeA, mustRR(t, `early.scion. 300 IN A 10.20.3.215`))
 	f.setDelay("early.scion.", dns.TypeA, 500*time.Millisecond)
@@ -526,7 +484,7 @@ func TestResolveHost_ReleasesWithoutAWhenSVCBAndAAAAComplete(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	start := time.Now()
-	res, err := ResolveHost(ctx, "early.scion", 443, ResolveOptions{Resolver: f.addr})
+	res, err := ResolveHost(ctx, "early.scion", 443, ResolveOptions{Resolver: f.addr, RRType: RRSVCB})
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("ResolveHost: %v", err)
@@ -598,8 +556,8 @@ func TestResolveHost_ResolutionDelayReleasesWithAOnly(t *testing.T) {
 		t.Fatalf("ResolveHost: %v", err)
 	}
 
-	if elapsed < 30*time.Millisecond || elapsed > 200*time.Millisecond {
-		t.Fatalf("Initial released after %v, want ~50ms (Resolution Delay path, AAAA still outstanding)", elapsed)
+	if elapsed < 15*time.Millisecond || elapsed > 200*time.Millisecond {
+		t.Fatalf("Initial released after %v, want ~25ms (Resolution Delay path, AAAA still outstanding)", elapsed)
 	}
 	if got := labels(res.Initial); len(got) != 1 {
 		t.Fatalf("Initial = %v, want exactly the A candidate", got)
@@ -625,13 +583,13 @@ func TestResolveHost_ResolutionDelayReleasesWithAOnly(t *testing.T) {
 func TestResolveHost_ContextCancelUnblocksAbandonedUpdatesSend(t *testing.T) {
 	f := newFakeDNS(t)
 	f.set("leak.scion.", dns.TypeSVCB, mustRR(t,
-		`leak.scion. 300 IN SVCB 1 . alpn=h3 scion=1-150\\,10.20.3.215`))
+		`leak.scion. 300 IN SVCB 1 . alpn=h3 scion=1-150_10.20.3.215`))
 	f.setDelay("leak.scion.", dns.TypeSVCB, 300*time.Millisecond) // arrives after Initial, forcing an Update send
 	f.set("leak.scion.", dns.TypeAAAA, mustRR(t, `leak.scion. 300 IN AAAA 2001:db8::215`))
 	f.set("leak.scion.", dns.TypeA, mustRR(t, `leak.scion. 300 IN A 10.20.3.215`))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	res, err := ResolveHost(ctx, "leak.scion", 443, ResolveOptions{Resolver: f.addr})
+	res, err := ResolveHost(ctx, "leak.scion", 443, ResolveOptions{Resolver: f.addr, RRType: RRSVCB})
 	if err != nil {
 		cancel()
 		t.Fatalf("ResolveHost: %v", err)
@@ -662,13 +620,13 @@ func TestResolveHost_ContextCancelUnblocksAbandonedUpdatesSend(t *testing.T) {
 func TestResolveHost_HexASNScionParam(t *testing.T) {
 	f := newFakeDNS(t)
 	f.set("games.scion.", dns.TypeSVCB, mustRR(t,
-		`games.scion. 300 IN SVCB 1 . alpn=h3 scion=71-2:0:4a\\,10.44.25.3`))
+		`games.scion. 300 IN SVCB 1 . alpn=h3 scion=71-2:0:4a_10.44.25.3`))
 	f.set("games.scion.", dns.TypeAAAA, mustRR(t, `games.scion. 300 IN AAAA 2001:db8::44`))
 	f.set("games.scion.", dns.TypeA, mustRR(t, `games.scion. 300 IN A 10.44.25.9`))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	res, err := ResolveHost(ctx, "games.scion", 443, ResolveOptions{Resolver: f.addr})
+	res, err := ResolveHost(ctx, "games.scion", 443, ResolveOptions{Resolver: f.addr, RRType: RRSVCB})
 	if err != nil {
 		t.Fatalf("ResolveHost: %v", err)
 	}
@@ -713,13 +671,13 @@ func TestResolveHost_HexASNScionParam(t *testing.T) {
 func TestResolveHost_SCIONOnlyNoAddresses(t *testing.T) {
 	f := newFakeDNS(t)
 	f.set("games.scion.", dns.TypeSVCB, mustRR(t,
-		`games.scion. 300 IN SVCB 1 . alpn=h3 scion=1-150\\,10.20.3.215`))
+		`games.scion. 300 IN SVCB 1 . alpn=h3 scion=1-150_10.20.3.215`))
 	// Deliberately no AAAA/A records registered: both are NODATA.
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	start := time.Now()
-	res, err := ResolveHost(ctx, "games.scion", 443, ResolveOptions{Resolver: f.addr})
+	res, err := ResolveHost(ctx, "games.scion", 443, ResolveOptions{Resolver: f.addr, RRType: RRSVCB})
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("ResolveHost: %v, want nil error (SCION-only names must resolve, not hang to ctx deadline)", err)
@@ -784,20 +742,20 @@ func TestResolveHost_AllNegativeReturnsEmptyPromptly(t *testing.T) {
 func TestResolveHost_SCIONOnlyReleasesAtDelayWithSlowAAAA(t *testing.T) {
 	f := newFakeDNS(t)
 	f.set("slowv6.scion.", dns.TypeSVCB, mustRR(t,
-		`slowv6.scion. 300 IN SVCB 1 . alpn=h3 scion=1-150\\,10.20.3.215`))
+		`slowv6.scion. 300 IN SVCB 1 . alpn=h3 scion=1-150_10.20.3.215`))
 	f.setDelay("slowv6.scion.", dns.TypeAAAA, 500*time.Millisecond) // no AAAA record; negative, late
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	start := time.Now()
-	res, err := ResolveHost(ctx, "slowv6.scion", 443, ResolveOptions{Resolver: f.addr})
+	res, err := ResolveHost(ctx, "slowv6.scion", 443, ResolveOptions{Resolver: f.addr, RRType: RRSVCB})
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("ResolveHost: %v", err)
 	}
 
-	if elapsed < 30*time.Millisecond || elapsed > 200*time.Millisecond {
-		t.Fatalf("Initial released after %v, want ~50ms (delay path; AAAA still outstanding)", elapsed)
+	if elapsed < 15*time.Millisecond || elapsed > 200*time.Millisecond {
+		t.Fatalf("Initial released after %v, want ~25ms (delay path; AAAA still outstanding)", elapsed)
 	}
 	if got := labels(res.Initial); len(got) != 1 {
 		t.Fatalf("Initial = %v, want exactly the SCION candidate", got)
@@ -857,13 +815,13 @@ func TestResolveSVCB_AliasChaseCaseInsensitiveSelfAlias(t *testing.T) {
 func TestResolve_TruncatedUDPFallsBackToTCP(t *testing.T) {
 	f := newFakeDNS(t)
 	f.set("web.scion.", dns.TypeSVCB, mustRR(t,
-		`web.scion. 300 IN SVCB 1 . alpn=h3 scion=1-150\\,10.20.3.215`))
+		`web.scion. 300 IN SVCB 1 . alpn=h3 scion=1-150_10.20.3.215`))
 	f.set("web.scion.", dns.TypeAAAA, mustRR(t, `web.scion. 300 IN AAAA 2001:db8::215`))
 	f.setTruncateUDP("web.scion.", dns.TypeSVCB)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	res, err := ResolveHost(ctx, "web.scion", 443, ResolveOptions{Resolver: f.addr})
+	res, err := ResolveHost(ctx, "web.scion", 443, ResolveOptions{Resolver: f.addr, RRType: RRSVCB})
 	if err != nil {
 		t.Fatalf("ResolveHost: %v", err)
 	}
@@ -887,7 +845,7 @@ func TestResolve_TruncatedUDPFallsBackToTCP(t *testing.T) {
 func TestResolve_HTTPSRecordType(t *testing.T) {
 	f := newFakeDNS(t)
 	f.set("web.scion.", dns.TypeHTTPS, mustRR(t,
-		`web.scion. 300 IN HTTPS 1 . alpn=h3 port=8443 scion=1-150\\,10.20.3.215`))
+		`web.scion. 300 IN HTTPS 1 . alpn=h3 port=8443 scion=1-150_10.20.3.215`))
 	f.set("web.scion.", dns.TypeAAAA, mustRR(t, `web.scion. 300 IN AAAA 2001:db8::215`))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -914,19 +872,19 @@ func TestResolve_HTTPSRecordType(t *testing.T) {
 	}
 }
 
-// Default mode queries both types in parallel and prefers HTTPS answers
-// when both exist (migration default; see spec §4.2).
+// RRBoth queries both types in parallel and prefers HTTPS answers when both
+// exist.
 func TestResolve_BothPrefersHTTPS(t *testing.T) {
 	f := newFakeDNS(t)
 	f.set("web.scion.", dns.TypeHTTPS, mustRR(t,
-		`web.scion. 300 IN HTTPS 1 . alpn=h3 port=1111 scion=1-150\\,10.20.3.215`))
+		`web.scion. 300 IN HTTPS 1 . alpn=h3 port=1111 scion=1-150_10.20.3.215`))
 	f.set("web.scion.", dns.TypeSVCB, mustRR(t,
-		`web.scion. 300 IN SVCB 1 . alpn=h3 port=2222 scion=1-150\\,10.20.3.215`))
+		`web.scion. 300 IN SVCB 1 . alpn=h3 port=2222 scion=1-150_10.20.3.215`))
 	f.set("web.scion.", dns.TypeAAAA, mustRR(t, `web.scion. 300 IN AAAA 2001:db8::215`))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	res, err := ResolveHost(ctx, "web.scion", 443, ResolveOptions{Resolver: f.addr}) // RRType zero = RRBoth
+	res, err := ResolveHost(ctx, "web.scion", 443, ResolveOptions{Resolver: f.addr, RRType: RRBoth})
 	if err != nil {
 		t.Fatalf("ResolveHost: %v", err)
 	}
@@ -975,8 +933,8 @@ func TestResolve_FailsOverToSecondServer(t *testing.T) {
 func TestResolve_MultipleServiceRecords(t *testing.T) {
 	f := newFakeDNS(t)
 	f.set("web.scion.", dns.TypeSVCB,
-		mustRR(t, `web.scion. 300 IN SVCB 2 . alpn=h3 port=2222 scion=1-151\\,10.20.3.216`),
-		mustRR(t, `web.scion. 300 IN SVCB 1 . alpn=h3 port=1111 scion=1-150\\,10.20.3.215`))
+		mustRR(t, `web.scion. 300 IN SVCB 2 . alpn=h3 port=2222 scion=1-151_10.20.3.216`),
+		mustRR(t, `web.scion. 300 IN SVCB 1 . alpn=h3 port=1111 scion=1-150_10.20.3.215`))
 	f.set("web.scion.", dns.TypeAAAA, mustRR(t, `web.scion. 300 IN AAAA 2001:db8::215`))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -1012,6 +970,42 @@ func TestResolve_MultipleServiceRecords(t *testing.T) {
 	}
 }
 
+// The same SCION address in two ServiceMode records yields one endpoint per
+// record, each with its record's port and priority: the first keeps the
+// plain label, the others get the port and priority in their labels.
+func TestResolve_SameSCIONAddressInTwoRecords(t *testing.T) {
+	f := newFakeDNS(t)
+	f.set("web.scion.", dns.TypeHTTPS,
+		mustRR(t, `web.scion. 300 IN HTTPS 1 . alpn=h3 port=1111 scion=1-150_10.20.3.215`),
+		mustRR(t, `web.scion. 300 IN HTTPS 2 . alpn=h3 port=2222 scion=1-150_10.20.3.215`),
+		mustRR(t, `web.scion. 300 IN HTTPS 3 . alpn=h3 port=2222 scion=1-150_10.20.3.215`))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	res, err := ResolveHost(ctx, "web.scion", 443, ResolveOptions{Resolver: f.addr})
+	if err != nil {
+		t.Fatalf("ResolveHost: %v", err)
+	}
+	all := res.Initial
+	if more, _ := drainUpdates(res.Updates, 2*time.Second); len(more) > 0 {
+		all = more[len(more)-1]
+	}
+	want := map[string][2]uint16{
+		"scion:1-150,10.20.3.215":         {1111, 1},
+		"scion:1-150,10.20.3.215@2222/p2": {2222, 2},
+		"scion:1-150,10.20.3.215@2222/p3": {2222, 3},
+	}
+	got := map[string][2]uint16{}
+	for _, c := range all {
+		if c.Family == FamilySCION {
+			got[c.Label] = [2]uint16{c.Port, c.Priority}
+		}
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("SCION endpoints (label: port, priority) = %v, want %v", got, want)
+	}
+}
+
 // alpn=h3,h2 must yield BOTH a QUIC and a TCP candidate per address, so
 // a UDP-blackholed network still converges on h2 (F8). alpn=h3 +
 // no-default-alpn yields only QUIC. alpn=h2 yields only TCP and drops
@@ -1019,7 +1013,7 @@ func TestResolve_MultipleServiceRecords(t *testing.T) {
 func TestRecordCandidates_TransportSplit(t *testing.T) {
 	f := newFakeDNS(t)
 	f.set("web.scion.", dns.TypeSVCB, mustRR(t,
-		`web.scion. 300 IN SVCB 1 . alpn=h3,h2 scion=1-150\\,10.20.3.215`))
+		`web.scion. 300 IN SVCB 1 . alpn=h3,h2 scion=1-150_10.20.3.215`))
 	f.set("web.scion.", dns.TypeAAAA, mustRR(t, `web.scion. 300 IN AAAA 2001:db8::215`))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -1058,7 +1052,7 @@ func TestRecordCandidates_QUICOnlyAndTCPOnly(t *testing.T) {
 		`q.scion. 300 IN SVCB 1 . alpn=h3 no-default-alpn`))
 	f.set("q.scion.", dns.TypeAAAA, mustRR(t, `q.scion. 300 IN AAAA 2001:db8::1`))
 	f.set("t.scion.", dns.TypeSVCB, mustRR(t,
-		`t.scion. 300 IN SVCB 1 . alpn=h2 scion=1-150\\,10.20.3.215`))
+		`t.scion. 300 IN SVCB 1 . alpn=h2 scion=1-150_10.20.3.215`))
 	f.set("t.scion.", dns.TypeAAAA, mustRR(t, `t.scion. 300 IN AAAA 2001:db8::2`))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -1175,7 +1169,7 @@ func TestResolve_UnassociatedAddressesTrail(t *testing.T) {
 func TestResolve_MixedCaseHostCoveredByDotRecord(t *testing.T) {
 	f := newFakeDNS(t)
 	f.set("web.scion.", dns.TypeSVCB, mustRR(t,
-		`web.scion. 300 IN SVCB 1 . alpn=h3 port=8443 scion=1-150\\,10.20.3.215`))
+		`web.scion. 300 IN SVCB 1 . alpn=h3 port=8443 scion=1-150_10.20.3.215`))
 	f.set("web.scion.", dns.TypeAAAA, mustRR(t, `web.scion. 300 IN AAAA 2001:db8::215`))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -1299,7 +1293,7 @@ func TestResolve_DelayTimerArmsAtFirstPositiveAnswer(t *testing.T) {
 func TestResolved_MinTTL(t *testing.T) {
 	f := newFakeDNS(t)
 	f.set("web.scion.", dns.TypeSVCB, mustRR(t,
-		`web.scion. 300 IN SVCB 1 . alpn=h3 scion=1-150\\,10.20.3.215`))
+		`web.scion. 300 IN SVCB 1 . alpn=h3 scion=1-150_10.20.3.215`))
 	f.set("web.scion.", dns.TypeAAAA, mustRR(t, `web.scion. 60 IN AAAA 2001:db8::215`))
 	f.set("web.scion.", dns.TypeA, mustRR(t, `web.scion. 3600 IN A 10.20.3.215`))
 
@@ -1312,5 +1306,86 @@ func TestResolved_MinTTL(t *testing.T) {
 	drainUpdates(res.Updates, 2*time.Second) // all queries final
 	if got := res.MinTTL(); got != 60*time.Second {
 		t.Errorf("MinTTL = %v, want 60s", got)
+	}
+}
+
+// The default sends the HTTPS query only: the draft adds no other DNS
+// queries to those of HEv3, which maps an https URL to one HTTPS query.
+func TestResolve_DefaultQueriesHTTPSOnly(t *testing.T) {
+	f := newFakeDNS(t)
+	f.set("web.scion.", dns.TypeHTTPS, mustRR(t, `web.scion. 300 IN HTTPS 1 . alpn=h3 scion=1-150_10.20.3.215`))
+	f.set("web.scion.", dns.TypeAAAA, mustRR(t, `web.scion. 300 IN AAAA 2001:db8::215`))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	tl := &Timeline{}
+	res, err := ResolveHost(ctx, "web.scion", 443, ResolveOptions{Resolver: f.addr, Timeline: tl})
+	if err != nil {
+		t.Fatalf("ResolveHost: %v", err)
+	}
+	drainUpdates(res.Updates, 2*time.Second)
+	var queries []string
+	for _, ev := range tl.Events() {
+		if ev.Kind == "query" {
+			queries = append(queries, ev.Label)
+		}
+	}
+	for _, q := range queries {
+		if strings.HasPrefix(q, "SVCB ") {
+			t.Fatalf("queries %v: default sent an SVCB query", queries)
+		}
+	}
+	if !slices.Contains(queries, "HTTPS web.scion.") {
+		t.Fatalf("queries %v: no HTTPS query", queries)
+	}
+}
+
+// A SCION-first client gets the SCION endpoints of the service answer as
+// soon as that answer is final, without waiting for the address answers;
+// the IP endpoints follow. This holds with the default single HTTPS query
+// and with the single SVCB query.
+func TestResolveHost_SCIONFirstReleasesSCIONEarly(t *testing.T) {
+	t.Run("https", func(t *testing.T) { testSCIONFirstReleasesSCIONEarly(t, RRHTTPS) })
+	t.Run("svcb", func(t *testing.T) { testSCIONFirstReleasesSCIONEarly(t, RRSVCB) })
+}
+
+func testSCIONFirstReleasesSCIONEarly(t *testing.T, rt RRType) {
+	f := newFakeDNS(t)
+	if rt == RRSVCB {
+		f.set("web.scion.", dns.TypeSVCB, mustRR(t, `web.scion. 300 IN SVCB 1 . alpn=h3 no-default-alpn scion=1-150_10.20.3.215`))
+	} else {
+		f.set("web.scion.", dns.TypeHTTPS, mustRR(t, `web.scion. 300 IN HTTPS 1 . alpn=h3 no-default-alpn scion=1-150_10.20.3.215`))
+	}
+	f.set("web.scion.", dns.TypeAAAA, mustRR(t, `web.scion. 300 IN AAAA 2001:db8::215`))
+	f.set("web.scion.", dns.TypeA, mustRR(t, `web.scion. 300 IN A 10.20.3.215`))
+	f.setDelay("web.scion.", dns.TypeAAAA, 200*time.Millisecond)
+	f.setDelay("web.scion.", dns.TypeA, 200*time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	res, err := ResolveHost(ctx, "web.scion", 443, ResolveOptions{Resolver: f.addr, SCIONFirst: true, RRType: rt})
+	if err != nil {
+		t.Fatalf("ResolveHost: %v", err)
+	}
+	if el := time.Since(start); el > 150*time.Millisecond {
+		t.Fatalf("Initial released after %v, want before the 200ms address answers", el)
+	}
+	if len(res.Initial) != 1 || res.Initial[0].Family != FamilySCION {
+		t.Fatalf("Initial = %v, want the SCION endpoint only", labels(res.Initial))
+	}
+	if !res.FirstIPAnswer().IsZero() {
+		t.Fatalf("FirstIPAnswer set before any address answer")
+	}
+	select {
+	case set := <-res.Updates:
+		if len(set) < 2 || set[0].Family == set[len(set)-1].Family {
+			t.Fatalf("update = %v, want the SCION endpoint and IP endpoints", labels(set))
+		}
+		if a := res.FirstIPAnswer(); a.IsZero() || a.Sub(start) < 150*time.Millisecond {
+			t.Fatalf("FirstIPAnswer = %v after start, want ~200ms", a.Sub(start))
+		}
+	case <-ctx.Done():
+		t.Fatal("no update with the IP endpoints")
 	}
 }

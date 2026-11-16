@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
@@ -17,11 +18,16 @@ import (
 )
 
 const (
-	// defaultK caps the number of ranked SCION paths ExpandSCION keeps.
-	defaultK = 3
+	// defaultK is the default Path Attempt Count: the most candidate paths
+	// attempted for one SCION endpoint.
+	defaultK = 2
 	// defaultDaemonAddr is the sciond address used when neither DialerOptions
 	// nor $SCION_DAEMON_ADDRESS specifies one.
 	defaultDaemonAddr = "127.0.0.1:30255"
+
+	// Path modes (DialerOptions.PathMode).
+	PathModeAttempts = "attempts"
+	PathModeCopy     = "copy"
 
 	alpnH3     = "h3"
 	alpnH2     = "h2"
@@ -32,9 +38,42 @@ const (
 type DialerOptions struct {
 	TLS        *tls.Config   // base client config; cloned per attempt, ALPN/ServerName overridden
 	DaemonAddr string        // sciond address; empty ⇒ $SCION_DAEMON_ADDRESS or defaultDaemonAddr
-	K          int           // ranked SCION paths per proto-candidate; 0 ⇒ defaultK
+	K          int           // Path Attempt Count: the most candidate paths attempted for a SCION endpoint; 0 => defaultK (2)
 	Timeline   *Timeline     // optional; records ExpandSCION drop/scitra notes
-	SCION      *scionContext // shared daemon/topology/local-IP state; nil ⇒ per-call behavior (lazy default)
+	SCION      *scionContext // shared daemon/topology/local-IP state; nil => per-call behavior (lazy default)
+	PathDelay  time.Duration // PathModeCopy only: Path Delay between adding racing paths; 0 => derived per path (see Options.PathDelay); negative => all paths at once
+	// PathMode: PathModeAttempts ("" too; a separate connection attempt per
+	// candidate path) or PathModeCopy (one connection, datagrams copied to
+	// the candidate paths).
+	PathMode string
+	// PathAttemptDelay is the time between the starts of the attempts over
+	// the candidate paths of one SCION endpoint; 0 => 50ms, below 10ms => 10ms.
+	PathAttemptDelay time.Duration
+	// Linger: how long a cancelled path attempt may go on so that it can be
+	// closed with CONNECTION_CLOSE (see attempts.go). 0 => derived;
+	// negative => cancelled attempts are dropped at once.
+	Linger time.Duration
+	// DeterministicPaths breaks ties in the candidate path selection by
+	// declared latency and fingerprint instead of at random.
+	DeterministicPaths bool
+	Lookups            *lookupGroup // shares path lookups per ISD-AS; nil => shared within one ExpandSCION call only
+	// MaxDestinationASes limits the number of distinct destination ASes
+	// (other than the client's own) whose paths are looked up within one
+	// Lookups group (draft-john-scion-svcb, Section 5.4). Endpoints in
+	// further ASes get no lookup and are not attempted. 0 => 4; negative =>
+	// no limit.
+	MaxDestinationASes int
+	BG                 *sync.WaitGroup // tracks cancelled path attempts still running; may be nil
+	// ExpCorruptPath (experiments only), if > 0, flips one MAC byte of the
+	// first hop field of the path with this 1-based rank in every path set,
+	// so border routers drop packets on it (Parameter Problem, not an
+	// interface-down SCMP).
+	ExpCorruptPath int
+	// ExpRefreshPaths (experiments only) makes every path lookup ask the
+	// SCION daemon to fetch the paths anew instead of answering from its
+	// cache.
+	ExpRefreshPaths bool
+	Stats           *statsCollector // optional; per-attempt racer stats and path lookups
 }
 
 // NewDialer returns a DialFunc that dispatches on the Candidate: a ViaScitra
@@ -121,7 +160,16 @@ func dialTCP(ctx context.Context, c Candidate, o DialerOptions) (*Established, e
 	proto := tconn.ConnectionState().NegotiatedProtocol
 
 	if proto == alpnH2 {
-		cc, err := (&http2.Transport{}).NewClientConn(tconn)
+		// http2.ConfigureTransports is the supported construction: it binds
+		// the http2.Transport to an http.Transport (its t1). A bare
+		// &http2.Transport{} has no t1 under go1.27 + x/net v0.56.0, and
+		// NewClientConn then dereferences a nil *http.Transport.
+		t2, err := http2.ConfigureTransports(&http.Transport{})
+		if err != nil {
+			_ = tconn.Close()
+			return nil, fmt.Errorf("hev3: dial tcp %s: h2 transport: %w", address, err)
+		}
+		cc, err := t2.NewClientConn(tconn)
 		if err != nil {
 			_ = tconn.Close()
 			return nil, fmt.Errorf("hev3: dial tcp %s: h2 client conn: %w", address, err)

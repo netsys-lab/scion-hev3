@@ -193,15 +193,35 @@ dl.gloss dd { margin: 0.15rem 0 0 1.2rem; color: var(--fg); }
 <p><strong>What this project is.</strong> <code>pkg/hev3</code> implements
 <a href="https://datatracker.ietf.org/doc/draft-ietf-happy-happyeyeballs-v3/">draft-ietf-happy-happyeyeballs-v3-04</a>
 extended with <a href="https://scion-architecture.net/">SCION</a>: it resolves a name via HTTPS/SVCB
-(including the <code>scion=</code> and <code>scion-policy=</code> SvcParams), AAAA and A, builds a candidate list spanning
+(including the <code>scion=</code> SvcParam), AAAA and A, builds a candidate list spanning
 three families (SCION, IPv6, IPv4), and races connection attempts with HEv3 staggering — first
 successful connection wins. <code>cmd/hev3</code> is the CLI front-end (<code>hev3 https://web.scion/</code>);
 <code>cmd/hev3-server</code> is the demo target that serves the same page over every transport and tags each
-response with the transport that delivered it. Two companion drafts (maintained separately in <a href="https://github.com/netsys-lab/draft-scion-svcb">netsys-lab/draft-scion-svcb</a>):
-<em>draft-john-scion-svcb-01</em> defines the <code>scion</code> (65280) and <code>scion-policy</code> (65281)
-SvcParamKeys (discovery), and <em>draft-john-scion-hev3-00</em> defines the client algorithm this library
-implements (asynchronous path expansion, three-family sorting, adaptive staggering, the optional
-Expansion Delay). Built for the SCION testbed at the IETF 126 hackathon.</p>
+response with the transport that delivered it. Two companion drafts:
+<em>draft-john-scion-svcb</em> (<a href="https://github.com/netsys-lab/draft-scion-svcb">netsys-lab/draft-scion-svcb</a>)
+defines the <code>scion</code> SvcParamKey (discovery; Private Use key 65280 until IANA assigns one), and
+<em>draft-john-scion-happy-eyeballs</em>
+(<a href="https://github.com/netsys-lab/draft-scion-happy-eyeballs">netsys-lab/draft-scion-happy-eyeballs</a>)
+defines the client algorithm this library implements: path lookup per SCION endpoint, a ranked path
+set of up to K paths, racing those paths within one QUIC connection, three-family sorting, the
+Expansion Delay, and failing paths on SCMP errors. Built for the SCION testbed at the IETF 126
+hackathon.</p>
+
+<p><strong>Note (separate path attempts, November 2026).</strong> This guide predates the
+current default design and has not been rewritten. Now: a SCION address is one endpoint; an attempt
+selects up to Path Attempt Count paths (<code>-k</code>, default 2) when it starts and opens a
+<em>separate</em> QUIC connection on each, one Path Attempt Delay (<code>-path-attempt-delay</code>,
+50 ms) apart (<code>attempts.go</code>). The Expansion Delay is gone: the path lookup is shared per
+ISD-AS (<code>lookupGroup</code> in <code>dial_scion.go</code>) and a SCION-first client waits for it
+no longer than the Resolution Delay (25 ms) after the first IP answer (<code>lookupWait</code>,
+<code>holdForGrace</code> in <code>engine.go</code>). SCMP errors are recorded and do not end an
+attempt. <code>-family-order ip-first</code> puts SCION last. The racer described in §8
+(<code>racer.go</code>, <code>-path-delay</code>) is what <code>-path-mode copy</code> still runs;
+<code>-expansion-delay</code> no longer exists. The README has the current summary.</p>
+
+<p><strong>Note (path racing rework).</strong> Sections below that predate the rework may still say
+"per-path candidates <code>#p1..#pK</code>": a SCION endpoint is now <em>one</em> candidate
+(<code>&lt;parent&gt;#paths</code>) carrying its ranked <code>PathSet</code>; see §8.</p>
 
 <p><strong>How to read this guide.</strong> Section 2 gives the end-to-end picture — read it first;
 everything later hangs off its two diagrams. Sections 3–14 are per-file deep dives ordered roughly by
@@ -253,7 +273,7 @@ results). The diagram below shows the real data flow — every box is a concrete
 <text class="diag-code" x="435" y="98">order  []label (insertion)</text>
 <text class="diag-code" x="435" y="116">pending []label (sorted, unlaunched)</text>
 <text class="diag-code" x="435" y="134">timer      — attempt stagger</text>
-<text class="diag-code" x="435" y="152">graceTimer — SCION-grace hold</text>
+<text class="diag-code" x="435" y="152">graceTimer — Expansion Delay hold</text>
 <text class="diag-text" x="435" y="178">resort() runs sortFn (Sort, sort.go)</text>
 <text class="diag-text" x="435" y="196">over the complete live set on every</text>
 <text class="diag-text" x="435" y="214">ingest / expansion arrival (§7)</text>
@@ -340,8 +360,8 @@ the §4.2 Resolution Delay) and then streams later <em>complete</em> sets on <co
 ingests each set into its candidate table; SCION candidates arrive as <em>proto-candidates</em>
 (<code>FamilySCION</code>, <code>Path == nil</code>) that are not dialable yet, so <code>ingest</code> hands each to an
 expander goroutine (<code>ExpandSCION</code>) instead of the pending list. Expansion results come back as
-<code>expandResult</code>s whose children (per-path native candidates <code>#p1..#pK</code>, or one scitra
-fallback) enter the table like any other candidate. Every ingest re-sorts the complete live set
+<code>expandResult</code>s whose child (one native candidate <code>#paths</code> carrying the endpoint's
+ranked path set, or one scitra fallback) enter the table like any other candidate. Every ingest re-sorts the complete live set
 (<code>Sort</code>), so a late arrival is positioned as if it had been present from the start. Launches are
 staggered by the attempt-delay timer; each launched attempt is one goroutine calling the
 <code>DialFunc</code>, which dispatches to one of three dialer families. First success cancels everything
@@ -443,20 +463,20 @@ placeholders that never appear in the sorted live list — only their children r
     Host      string      // IP literal, or SCION host IP
     Port      uint16
     IA        string      // "1-150"; empty for IP families
-    Path      *SCIONPath  // nil for IP families and the scitra leg
+    Path      *SCIONPath  // = &amp;PathSet[0]; nil for IP families, the scitra leg, and protos
+    PathSet   []SCIONPath // SCION endpoint's ranked path set (K paths max), raced in one QUIC conn
     ViaScitra bool        // SCION-derived candidate dialed as mapped IPv6
     ALPN      []string    // dial ALPN; empty = default (try h2/h1.1 over TCP)
     GroupALPN []string    // covering record's full ALPN set — §5.1 grouping key
     Priority  uint16      // SvcPriority
-    Label     string      // stable human id, e.g. "scion:1-150#p1", "v6:2001:db8::1"
-    Policy    *PathPolicy // scion-policy hint; SCION candidates only
+    Label     string      // stable human id, e.g. "scion:1-150,10.0.0.1#paths", "v6:2001:db8::1"
 }</code></pre>
 
 <ul>
 <li><strong><code>Label</code> is identity.</strong> The engine's table, the resolver's
 candidate-event dedup (<code>emitNewCandidates</code>), and the CLI's race rows are all keyed by
 <code>Label</code>. Labels follow fixed prefixes — <code>scion:</code>, <code>scitra:</code>, <code>v6:</code>/<code>v6hint:</code>,
-<code>v4:</code>/<code>v4hint:</code>, with <code>+tcp</code> inserted for TCP siblings and <code>#pN</code> appended by
+<code>v4:</code>/<code>v4hint:</code>, with <code>+tcp</code> inserted for TCP siblings and <code>#paths</code> appended by
 path expansion — and <code>cmd/hev3</code>'s <code>familyFromLabel</code> relies on exactly these prefixes.</li>
 <li><strong><code>GroupALPN</code> vs <code>ALPN</code>.</strong> <code>ALPN</code> is what the dialer offers
 (<code>["h3"]</code> for a QUIC leg; supported-minus-h3 for its TCP sibling). <code>GroupALPN</code> is the
@@ -464,18 +484,15 @@ covering record's <em>full</em> supported set and is the §5.1 grouping key in <
 record's QUIC and TCP candidates in the same group so racing is per-address QUIC-before-TCP, not
 all-QUIC-then-all-TCP. <code>nil</code> <code>GroupALPN</code> (legacy no-record and unassociated-trailing
 candidates) falls back to grouping by <code>ALPN</code>.</li>
-<li><strong><code>Policy</code></strong> is the client-side view of a <code>scion-policy</code> SvcParam
-(<code>PathPolicy</code>: ordered <code>Prefer</code> metrics — latency, bottleneck bandwidth, hops — plus
-optional <code>MaxLatency</code>/<code>MinBandwidthKbps</code> thresholds, zero = none). It travels on the
-proto-candidate and is consumed by <code>rankPaths</code>/<code>filterByPolicy</code> during expansion.</li>
 <li><strong><code>ViaScitra</code></strong> marks a SCION-derived candidate rewritten to a mapped IPv6 address;
 it is <code>FamilyIPv6</code> for sorting/interleave purposes but keeps <code>IA</code> and a
 <code>scitra:</code> label.</li>
-<li><strong><code>Path</code></strong> (<code>*SCIONPath</code>: fingerprint, summed advertised latency, hop count,
-and the pinned <code>snet.Path</code> stored as <code>any</code> so pure-logic files need no scionproto import)
-distinguishes a dialable per-path SCION candidate from a proto-candidate (<code>Path == nil</code>).
-"Any candidate anywhere has <code>Path != nil</code>" is also the signal (<code>hasNativeSCIONPath</code>) that
-native SCION exists, which flips the family-interleave preference in <code>Sort</code>.</li>
+<li><strong><code>PathSet</code>/<code>Path</code></strong> (<code>SCIONPath</code>: fingerprint, summed declared
+latency, AS hops, interface string, down-cache flag, and the <code>snet.Path</code> stored as
+<code>any</code> so pure-logic files need no scionproto import). <code>Path</code> points at the top-ranked
+path and distinguishes an expanded SCION endpoint from a proto-candidate (<code>Path == nil</code>).
+"Any native (non-scitra) <code>FamilySCION</code> candidate" is the signal (<code>hasSCION</code>) that
+the client has SCION connectivity, which orders SCION first in <code>Sort</code>.</li>
 </ul>
 
 <h2 id="resolver">4. resolver.go — DNS to candidates <span class="file">pkg/hev3/resolver.go</span></h2>
@@ -546,9 +563,9 @@ overrides or supplements live A/AAAA data.</li>
 runs of equal priority (§5.2) with a <em>run-stable</em> RNG (seeded from <code>ShuffleSeed</code>, or 8
 bytes of <code>crypto/rand</code> per run). It is called exactly once per qtype so rebuilds never
 reshuffle — a reshuffle would emit spurious Updates.</li>
-<li><strong>RRType selection.</strong> <code>RRBoth</code> (default) queries HTTPS and SVCB in parallel and the
-<code>chosen</code> closure prefers the HTTPS answer's records when present — the migration default
-while deployed zones still use SVCB.</li>
+<li><strong>RRType selection.</strong> <code>RRHTTPS</code> (default) sends the one HTTPS query the draft specifies. <code>RRSVCB</code> sends an SVCB
+query instead. <code>RRBoth</code> queries HTTPS and SVCB in parallel and the <code>chosen</code> closure prefers
+the HTTPS answer's records when present; it is not in the draft and is for zones that publish only SVCB records.</li>
 <li><strong>ISD-AS presentation.</strong> <code>scionIA</code> recomputes the canonical form from
 <code>ISD</code>/<code>ASN</code> instead of calling <code>addr.String()</code>: the forked dns module's wire
 pack/unpack loses the hex-vs-decimal presentation bit, so large ("SCION-only") ASNs are printed
@@ -625,6 +642,7 @@ so new arrivals launch within one normal interval instead of being stranded unti
 attempt finishes).</p>
 
 <h3>Adaptive delay</h3>
+<p>Off by default and not in the draft; <code>-adaptive-delay</code> turns it on.</p>
 <pre><code>// nextDelay: clamp(2·Latency + 60ms, minDelay, base)
 d := e.cfg.delay
 if e.cfg.adaptive &amp;&amp; c.Family == FamilySCION &amp;&amp; c.Path != nil &amp;&amp; c.Path.Latency &gt; 0 {
@@ -634,7 +652,7 @@ if e.cfg.adaptive &amp;&amp; c.Family == FamilySCION &amp;&amp; c.Path != nil &a
     }
 }
 if d &gt; e.cfg.delay { d = e.cfg.delay } // final re-cap</code></pre>
-<p>After launching a SCION per-path candidate with known latency <em>L</em>, the next stagger tightens
+<p>After launching a SCION endpoint whose top path has known latency <em>L</em>, the next stagger tightens
 to <code>clamp(2L+60ms, minDelay, base)</code> — the shortcut can only shorten the base stagger, never
 lengthen it; the final re-cap guarantees that even a misconfigured <code>minDelay</code> above base cannot
 drag the next attempt out. <code>runEngine</code>'s defaulting establishes the bounds first:
@@ -642,18 +660,21 @@ base delay ≤0 ⇒ 250ms, min ≤0 ⇒ 100ms, max ≤0 ⇒ 2s, and <em>everythi
 <code>minAttemptDelayFloor</code> = 10ms (the draft §6 MUST — an explicit sub-10ms cap cannot defeat the
 floor) with the base capped at max.</p>
 
-<h3>SCION grace (Expansion Delay)</h3>
-<p><code>holdForGrace(lbl)</code> gates a launch when: grace is configured (<code>scionGrace &gt; 0</code>),
-the window hasn't closed (<code>!graceOver</code>), at least one expansion is in flight
-(<code>expanding &gt; 0</code>), and the pending head is not itself SCION. SCION children never wait, and
-scitra children can't be held either — they only exist after their parent's expansion completes,
-which drops <code>expanding</code> to zero and with it the gate. When the gate holds, the head stays in
-pending, the grace timer is armed once, and the stagger stays disarmed. Release is one of two paths:
-expansion completing (the <code>expandResults</code> case closes the window when <code>expanding == 0</code> and
-drains the backstop timer so a stale tick can't fire late) or the grace expiring
-(<code>graceTimer.C</code> sets <code>graceOver</code>). <code>graceOver</code> is <strong>one-way</strong>:
-once set, <code>holdForGrace</code> is inert for the rest of the run. This implements the algorithm
-draft's optional "Expansion Delay", surfaced as the CLI's <code>-scion-grace</code> knob.</p>
+<h3>Expansion Delay</h3>
+<p><code>holdForGrace(lbl)</code> implements the Expansion Delay of draft-john-scion-happy-eyeballs: it
+holds a launch when the delay is configured (<code>expansionDelay &gt; 0</code>; Fetch defaults it to
+50ms, negative disables), the window hasn't closed (<code>!graceOver</code>), no IP attempt has started
+yet (<code>!ipLaunched</code> - only the <em>first</em> IP attempt is held), a path lookup is in flight
+(<code>expanding &gt; 0</code>), the pending head is not SCION, and an endpoint whose lookup is in
+flight would sort before the head (<code>expandingPrecedes</code>). While held, the grace timer is armed
+once and the stagger stays disarmed; lookups completing or the timer firing release the head.
+<code>graceOver</code> is one-way. CLI: <code>-expansion-delay</code> (0 = off).</p>
+
+<h3>SCION attempt failure</h3>
+<p>When the most recent attempt fails, the next pending candidate launches without waiting for the
+stagger. After a failed SCION attempt (e.g. every path of its set failed on SCMP errors), the launch
+is deferred to at least <code>minDelay</code> (the Minimum Connection Attempt Delay) after the failed
+attempt started (<code>lastStart</code>).</p>
 
 <h3>Terminal conditions</h3>
 <ul>
@@ -697,14 +718,15 @@ extended to three families. The stages, in order:</p>
 (order/duplicates ignored) share a group, keyed off <code>GroupALPN</code> when present so one record's
 QUIC and TCP siblings stay together (see §3). Groups sort ascending by their best (lowest) member
 <code>Priority</code>, first-seen order breaking ties.</li>
-<li><strong>Within each group, bucket by family.</strong> The SCION bucket sorts by §5.1 Priority only,
-<em>stably</em> — stability is what preserves the path-rank order (<code>#p1</code> before <code>#p2</code>)
-that <code>ExpandSCION</code> produced. IP buckets go through <code>sortIPBucket</code>.</li>
-<li><strong>Family interleave</strong> (<code>sortGroup</code>): with native SCION
-(<code>nativeSCION</code> = any candidate carries a pinned <code>Path</code>; scitra legs don't count) the
-preference order is SCION, IPv6, IPv4; without it, IPv6 then IPv4, with any stray
-<code>FamilySCION</code> candidate appended last rather than interleaved. Per round the preferred family
-takes <code>preferredFamilyCount</code> picks (the CLI's <code>-pfc</code>), every other family exactly one —
+<li><strong>Within each group, bucket by family.</strong> Each group is first split by service priority, lowest value first. The SCION
+endpoints of one priority are ordered at random among themselves (one random order per process, so sorting again
+keeps it), with endpoints still in path lookup last. IP buckets go through <code>sortIPBucket</code>.</li>
+<li><strong>Family interleave</strong> (<code>sortPriorityGroup</code>): with native SCION
+(<code>nativeSCION</code> = any native <code>FamilySCION</code> candidate; scitra legs don't count) the
+preference order is SCION, then the family of the first IP endpoint after RFC 6724 ordering of the
+IPv6 and IPv4 buckets together (<code>firstIPFamily</code>), then the other IP family; without it, IPv6 then IPv4, with any stray
+<code>FamilySCION</code> candidate appended last rather than interleaved. The first family
+takes <code>preferredFamilyCount</code> endpoints (the CLI's <code>-pfc</code>) at the start of the list only; after that every family takes one in turn —
 RFC 8305 §4's interleave generalized to N families. ViaScitra candidates are
 <code>FamilyIPv6</code> and interleave normally.</li>
 </ol>
@@ -740,11 +762,10 @@ inject fixed sources. Unparseable hosts get the zero key: a stable fallback.</p>
 (<code>FamilySCION, Path == nil, !ViaScitra</code>) into dialable ones; everything else passes through
 unchanged. Three outcomes per proto:</p>
 <ul>
-<li><strong>Live daemon</strong> ⇒ <code>expandOne</code>: parse the IA, query paths, apply
-<code>filterByPolicy</code> then <code>rankPaths</code>, truncate to K (default <code>defaultK</code> = 3), and emit
-per-path candidates labelled <code>&lt;parent&gt;#p1..#pK</code>, each with a pinned
-<code>SCIONPath{Fingerprint, Latency, Hops, SNET}</code> where <code>Latency</code> is
-<code>knownLatency</code> — the sum of non-negative advertised per-hop latencies.</li>
+<li><strong>Live daemon</strong> ⇒ <code>expandOne</code>: parse the IA, query paths, select the ranked
+path set (<code>selectPathSet</code>, pathset.go; K default 3), and emit <em>one</em> candidate
+labelled <code>&lt;parent&gt;#paths</code> with <code>PathSet</code> in rank order. Lookup time, daemon setup
+time, paths found, set and exclusions go to <code>LookupStats</code>.</li>
 <li><strong>No daemon</strong> (querier resolution failed) ⇒ <code>fallbackNoDaemon</code>: if
 <code>scitraAvailable()</code>, each proto becomes one <code>ViaScitra</code> candidate
 (<code>scitraCandidate</code>: FamilyIPv6, host rewritten via <code>ScitraMap</code>, label
@@ -754,17 +775,15 @@ route"</code> timeline note.</li>
 ⇒ dropped with a note — scitra is strictly the <em>no-daemon</em> fallback and does not apply here.</li>
 </ul>
 
-<h3>Path ranking and scion-policy</h3>
-<p><code>pathKeyOf</code> projects each path's metadata into a <code>pathKey</code>: summed latency
-(<code>latUnset</code> if any hop is negative/unset), <strong>bottleneck bandwidth</strong> — the
-<em>minimum</em> announced hop bandwidth, with a zero hop or an empty list marking it unset — hop
-count, and fingerprint. <code>metricCmp</code> compares one metric with "missing sorts last" semantics;
-bandwidth is better when larger. <code>rankPaths</code> orders by the policy's <code>Prefer</code> list
-(default latency-then-hops), appends the default metrics not already named as trailing tie-breaks,
-and uses the fingerprint as the deterministic last resort. <code>filterByPolicy</code> drops paths that
-<em>provably</em> violate a threshold (a path missing the metric can't violate it); if every path
-violates, the thresholds are ignored entirely — the draft's fail-open MUST — and the caller leaves
-a <code>"…ignored (fail-open)"</code> note.</p>
+<h3>Path selection <span class="file">pkg/hev3/pathset.go</span></h3>
+<p><code>selectPathSet</code>: expired paths are excluded; paths expiring within 2s only if nothing else
+is left; paths whose metadata MTU cannot carry a 1200-octet QUIC datagram plus the SCION (common,
+address, path) and UDP headers are excluded (SCION dials pin quic-go's <code>InitialPacketSize</code> to
+1200 so the check matches). Ranking is greedy (<code>rankGreedy</code>): first the path with the fewest
+AS hops, then repeatedly the path with the least overlap with those already selected (shared transit
+ASes, then shared pairs of adjacent ASes, then shared inter-AS links);
+ties by AS hops, then declared latency (known first), then fingerprint. Paths through an interface in
+the SCMP down cache (<code>scmpDownCache</code>, 10s TTL) rank after all others.</p>
 
 <h3>scionContext — shared daemon state</h3>
 <p>A <code>scionContext</code> (created per-Fetch by <code>newSCIONContext</code>, shared via
@@ -791,17 +810,33 @@ reaps the just-produced connection (which then surfaces as <code>errSCIONContext
 nothing left to reap.</li>
 </ul>
 
-<h3>dialSCION</h3>
+<h3>dialSCION and the path racer <span class="file">pkg/hev3/racer.go</span></h3>
 <p>Native h3 over SCION: get (connector, topology, localIP) — from the shared context when
 <code>o.SCION != nil</code> (never closing the shared connector), else inline with owned-connection
-cleanup on every error path — then build an <code>snet.SCIONNetwork</code> with an SCMP handler chain
-(<code>SCMPPropagationStopper</code> wrapping <code>DefaultSCMPHandler</code> with a daemon-backed
-<code>RevocationHandler</code>), <code>Listen</code> on an ephemeral UDP port, and dial
-<code>quic.Transport{Conn: snetConn}</code> directly. It deliberately does <em>not</em> use
+cleanup on every error path — then <code>dialRacing</code>: build an <code>snet.SCIONNetwork</code> whose
+SCMP handler is a <code>pathRacer</code>, <code>Listen</code> (dispatcherless, concrete local IP, port 0),
+and dial <code>quic.Transport{Conn: racer}</code>. The racer is a <code>net.PacketConn</code> between
+quic-go and the <code>snet.Conn</code>: it starts on the top-ranked path, adds the next path when
+the Path Delay of the most recently added path elapses (<code>pathdelay.go</code>: smoothed RTT plus
+twice the RTT variation of that path from <code>pathRTTHistory</code>, which <code>Established.Close</code>
+fills from quic-go's <code>ConnectionStats</code> for the selected path; else four times its declared
+latency; else 50ms; within [10ms, attempt delay]; a configured delay is fixed, negative = all at once) and at
+once when every added path has failed, sends each new path copies of the datagrams already sent,
+and until a path is selected sends every datagram on every added, non-failed path. It selects a path
+when a datagram from the server, whose first QUIC packet carries one of the client's own connection
+IDs as its Destination Connection ID, arrives on a path whose hop-field interface pairs (after
+reversal) match an added, non-failed set path (<code>"reply"</code>), or when quic-go sends its first 1-RTT packet
+(<code>"1rtt"</code>); afterwards it sends only on that path. SCMP External Interface Down / Internal
+Connectivity Down errors quoting a datagram sent on a set path fail that path and enter the down
+cache; when all paths have failed the racer cancels the dial context with
+<code>errAllPathsFailed</code>. Other SCMP types are ignored; per-packet snet read errors are dropped. The connection ID check
+matters because snet binds the highest free port of the dispatched range, so successive connections
+reuse the same local port and late datagrams of the previous connection reach the new socket
+(counted as <code>recv_foreign</code>).
+Per-attempt racer stats (<code>RacerStats</code>) are returned in <code>Result.SCIONAttempts</code>. It deliberately does <em>not</em> use
 <code>pkg/snet/squic</code>: squic wraps the QUIC session as a single-stream <code>net.Conn</code> for
-control-plane RPC, whereas HTTP/3 needs the raw <code>*quic.Conn</code>. The remote
-<code>snet.UDPAddr</code> pins the dataplane path and underlay next hop from the candidate's ranked
-<code>snet.Path</code>.</p>
+control-plane RPC, whereas HTTP/3 needs the raw <code>*quic.Conn</code>. The racer tests
+(racer_test.go) emulate paths with UDP relays between a real snet client and server.</p>
 
 <h2 id="dial-scitra">9. dial_scitra.go — the translator leg <span class="file">pkg/hev3/dial_scitra.go</span></h2>
 
@@ -858,7 +893,7 @@ lazily by the first <code>Add</code>, so all timestamps are relative to the firs
 <tr><th>Kind</th><th>Emitted by</th><th>Meaning</th></tr>
 <tr><td><code>query</code> / <code>answer</code></td><td>resolver <code>exchange</code></td><td>one DNS exchange started/settled; label = <code>"&lt;TYPE&gt; &lt;name&gt;"</code>; answer detail carries the error, if any</td></tr>
 <tr><td><code>candidate</code></td><td>resolver <code>emitNewCandidates</code></td><td>a label newly present in a released set (deduped across rebuilds by label)</td></tr>
-<tr><td><code>fail</code> (note)</td><td>resolver <code>noteOnce</code>, expansion <code>note</code></td><td>drop notes: unsupported mandatory key, no client-supported ALPN, SCION-without-QUIC, no paths, no daemon/scitra, policy fail-open</td></tr>
+<tr><td><code>fail</code> (note)</td><td>resolver <code>noteOnce</code>, expansion <code>note</code></td><td>drop notes: unsupported mandatory key, no client-supported ALPN, SCION-without-QUIC, no paths, no selectable path, no daemon/scitra</td></tr>
 <tr><td><code>attempt</code></td><td>engine <code>launch</code></td><td>a dial goroutine started for this label</td></tr>
 <tr><td><code>fail</code></td><td>engine results case</td><td>the labelled attempt returned an error (detail = error text)</td></tr>
 <tr><td><code>success</code> / <code>winner</code></td><td>engine <code>finish</code></td><td>the winning attempt (both fire for the same label)</td></tr>
@@ -886,10 +921,11 @@ legs), roots from <code>Options.CAFile</code> or <code>defaultCAFile</code> (<co
 exists, else the system pool.</li>
 <li><code>newSCIONContext(dOpts)</code> with <code>defer sctx.Close()</code> registered <em>before</em>
 <code>defer est.Close()</code> — LIFO means the connection closes first, then the shared daemon
-connector: the winner's SCMP revocation handler references that connector, so the order matters.</li>
+connector. With <code>Options.Session</code> (CLI <code>-repeat</code>) the session's context is used
+instead and outlives the Fetch.</li>
 <li><code>runEngine</code> with the full dynamic config: <code>sortFn</code> closes over
-<code>hasNativeSCIONPath(cs)</code> (recomputed per resort — native preference can flip mid-race when
-expansion lands) and the effective PFC; <code>isProto</code> is
+<code>hasSCION(cs)</code> (recomputed per resort — SCION-first ordering ends if every SCION endpoint is
+dropped or becomes a scitra leg) and the effective PFC; <code>isProto</code> is
 <code>FamilySCION &amp;&amp; Path == nil &amp;&amp; !ViaScitra</code>; <code>expand</code> wraps
 <code>ExpandSCION</code> one candidate at a time.</li>
 <li><code>getOverWinner</code>: one GET over <code>est.RT</code>, body capped at
@@ -916,13 +952,19 @@ in, exit code out). Flags map 1:1 onto <code>hev3.Options</code>:</p>
 <div class="tablewrap"><table>
 <tr><th>Flag</th><th>Maps to</th><th>Notes</th></tr>
 <tr><td><code>-resolver</code></td><td><code>Resolver</code></td><td>"ip:port"; empty = /etc/resolv.conf</td></tr>
-<tr><td><code>-rr-type</code></td><td><code>RRType</code></td><td><code>https</code> | <code>svcb</code> | <code>both</code> (default; prefers HTTPS answers)</td></tr>
-<tr><td><code>-k</code></td><td><code>K</code></td><td>ranked SCION paths per candidate (0 = library default 3)</td></tr>
+<tr><td><code>-rr-type</code></td><td><code>RRType</code></td><td><code>https</code> | <code>svcb</code> | <code>both</code> (default <code>https</code>; <code>both</code> prefers HTTPS answers)</td></tr>
+<tr><td><code>-k</code></td><td><code>K</code></td><td>path set size per SCION endpoint (default 3)</td></tr>
+<tr><td><code>-path-delay</code></td><td><code>PathDelay</code></td><td><code>auto</code> (default): derived per path; a duration fixes it; 0 = all paths at once</td></tr>
+<tr><td><code>-scion</code></td><td><code>SCIONTarget</code></td><td>"ISD-AS,IP[:port]": skip DNS, race this SCION endpoint only</td></tr>
+<tr><td><code>-daemon</code></td><td><code>DaemonAddr</code></td><td>sciond address</td></tr>
+<tr><td><code>-repeat</code>, <code>-stats</code></td><td><code>Session</code></td><td>N fetches sharing one daemon connection; per-run lookup and racer stats</td></tr>
+<tr><td><code>-exp-corrupt-path</code></td><td><code>ExpCorruptPath</code></td><td>experiment: flip a MAC byte of path N's first hop field</td></tr>
 <tr><td><code>-pfc</code></td><td><code>PreferredFamilyCount</code></td><td>interleave width; rejected if &lt; 1</td></tr>
 <tr><td><code>-no-scion</code> / <code>-no-ip</code></td><td><code>NoSCION</code>/<code>NoIP</code></td><td>family filters (children exempt, §12)</td></tr>
 <tr><td><code>-attempt-delay</code>, <code>-min-attempt-delay</code>, <code>-max-attempt-delay</code></td><td>delay knobs</td><td>sub-10ms values only produce a stderr warning here — the actual clamping lives in <code>runEngine</code></td></tr>
-<tr><td><code>-no-adaptive-delay</code></td><td><code>NoAdaptiveDelay</code></td><td>disables the 2L+60ms shortcut</td></tr>
-<tr><td><code>-scion-grace</code></td><td><code>SCIONGrace</code></td><td>the Expansion Delay demo knob; 0 = off</td></tr>
+<tr><td><code>-adaptive-delay</code></td><td><code>AdaptiveDelay</code></td><td>enables the 2L+60ms shortcut (off by default; <code>-no-adaptive-delay</code> is accepted and has no effect)</td></tr>
+<tr><td><code>-max-ases</code></td><td><code>MaxDestinationASes</code></td><td>limit on distinct destination ASes whose paths are looked up (default 4)</td></tr>
+<tr><td><code>-expansion-delay</code></td><td><code>ExpansionDelay</code></td><td>default 50ms; 0 = off</td></tr>
 <tr><td><code>-resolution-delay</code></td><td><code>ResolutionDelay</code></td><td>§4.2 gate (default 50ms)</td></tr>
 <tr><td><code>-insecure</code>, <code>-ca</code></td><td><code>Insecure</code>/<code>CAFile</code></td><td>TLS trust</td></tr>
 <tr><td><code>-json</code>, <code>-timeout</code></td><td>—</td><td>output mode; overall ctx deadline (default 15s)</td></tr>
@@ -933,10 +975,10 @@ label first seen via <code>candidate</code> with no later <code>attempt</code> r
 otherwise outcome/timing come from <code>attempt</code> plus whichever of
 <code>success</code>/<code>fail</code>/<code>cancel</code> (and <code>winner</code>) follows. The one post-processing
 pass is <code>suppressExpandedProtoRows</code>: every SCION proto gets a <code>candidate</code> event under
-its un-suffixed label, but attempts only ever fire on the expanded <code>#pN</code> children — without
+its un-suffixed label, but attempts only ever fire on the expanded <code>#paths</code> child — without
 suppression the parent would sit forever as a misleading "never-started" ghost row next to its own
 children. The rule is precise: drop a never-started, outcome-less row only when some
-<em>started</em> row's label extends it with <code>#p</code>; a genuinely unreachable candidate keeps its
+<em>started</em> row's label extends it with <code>#</code>; a genuinely unreachable candidate keeps its
 row. <code>familyFromLabel</code> maps label prefixes back to family names for display
 (<code>scitra:</code> → "SCION(scitra)"). Both binaries also set
 <code>QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING</code> — snet conns are not <code>*net.UDPConn</code>, so
@@ -994,7 +1036,7 @@ injectable seam; keep new dependencies behind the same kind of seam.</p>
 <div class="tablewrap"><table>
 <tr><th>Seam</th><th>Where</th><th>Kind</th><th>What tests do with it</th></tr>
 <tr><td><code>resolveQuerier</code></td><td>dial_scion.go</td><td>package <code>var</code></td><td>swap in a <code>fakeQuerier</code> or return an error to force the daemon-absent (scitra/drop) branch; also used to count connects through one <code>scionContext</code> and to block mid-Once for the Close-race tests</td></tr>
-<tr><td><code>pathQuerier</code></td><td>dial_scion.go</td><td>interface</td><td><code>fakeQuerier</code> returns synthetic <code>snet.Path</code> fixtures with crafted latency/bandwidth/hop metadata for ranking and policy tests</td></tr>
+<tr><td><code>pathQuerier</code></td><td>dial_scion.go</td><td>interface</td><td><code>fakeQuerier</code> returns synthetic <code>snet.Path</code> fixtures with crafted latency/hop metadata for ranking tests</td></tr>
 <tr><td><code>procNetIPv6Route</code></td><td>dial_scitra.go</td><td>package <code>var</code> (file path)</td><td>point <code>scitraAvailable</code> at a fixture file with/without the fc00::/8 line</td></tr>
 <tr><td><code>udpSource</code></td><td>rfc6724.go</td><td>package <code>var</code> (func)</td><td>return fixed source addresses so RFC 6724 rules 1/2/9 are deterministic</td></tr>
 <tr><td><code>fakeDNS</code></td><td>resolver_test.go</td><td>in-process nameserver</td><td>per-(qtype,qname) RR map plus per-query <em>delays</em> and UDP <em>truncation</em> switches — how the §4.2 gate timing, TC→TCP retry, and multi-server failover are exercised against a real UDP/TCP listener on loopback</td></tr>
@@ -1003,19 +1045,17 @@ injectable seam; keep new dependencies behind the same kind of seam.</p>
 </table></div>
 
 <h3 id="forks">15.2 Forked dependencies (load-bearing)</h3>
-<p><code>go.mod</code> replaces two modules; the code will not compile or parse SVCB records against the
-upstreams:</p>
+<p><code>go.mod</code> replaces one module; the code will not parse SCION SVCB records against the
+upstream:</p>
 <ul>
 <li><code>github.com/miekg/dns</code> → <code>github.com/netsys-lab/dns-scion-svcb</code> — adds the typed
-<code>scion</code>/<code>scion-policy</code> SvcParamKeys the resolver consumes directly:
-<code>dns.SVCB_SCION</code>/<code>dns.SVCB_SCION_POLICY</code>, <code>dns.SVCBScion</code> (with
-<code>SCIONAddr</code> values), <code>dns.SVCBScionPolicy</code> (typed policy items). Upstream miekg/dns
+<code>scion</code> SvcParamKey the resolver consumes directly: <code>dns.SVCB_SCION</code> and
+<code>dns.SVCBScion</code> (with <code>SCIONAddr</code> values). Upstream miekg/dns
 would surface these as opaque unknown params — <code>parseServiceRecord</code>'s type switch and the
 whole SCION discovery path depend on the fork.</li>
-<li><code>github.com/scionproto/scion</code> → <code>github.com/lschulz/scion</code> — the snet/squic fork
-used for dispatcherless SCION QUIC; both the client dial (<code>dialSCION</code>) and the server
-listener (<code>scionServer</code>) build on its <code>snet.SCIONNetwork</code>/<code>quic.Transport</code>
-integration.</li>
+<li><code>github.com/scionproto/scion</code> is the upstream release v0.15.1 (no fork); dispatcherless
+<code>snet.SCIONNetwork</code> + quic-go v0.59.1 on both the client (<code>dialSCION</code>) and the
+server (<code>scionServer</code>).</li>
 </ul>
 
 <h3 id="invariants">15.3 Load-bearing invariants</h3>
@@ -1038,7 +1078,7 @@ semantics and the CLI's proto-row suppression (which depends on the <code>#p</co
 convention).</li>
 </ul>
 <div class="caveat"><strong>Known caveat — duplicate labels.</strong> A label encodes family, host (and the
-<code>+tcp</code>/<code>#pN</code>/hint variants) but <em>not</em> port or priority. Two ServiceMode records
+<code>+tcp</code>/<code>#paths</code>/hint variants) but <em>not</em> port or priority. Two ServiceMode records
 with different TargetNames that resolve to the same IP produce two candidates whose labels collide
 (e.g. both <code>v6:2001:db8::1</code>) even when their ports or priorities differ; the engine's
 first-wins ingest keeps the earlier one (the lower-priority record, since records are emitted in
@@ -1052,9 +1092,10 @@ general-purpose key.</div>
 <dd>A SCION candidate straight out of DNS: <code>FamilySCION</code>, <code>Path == nil</code>,
 <code>!ViaScitra</code>. Not dialable — a placeholder the engine hands to expansion instead of the
 pending list.</dd>
-<dt>per-path candidate</dt>
-<dd>A dialable SCION candidate produced by <code>ExpandSCION</code>: the proto plus one ranked, pinned
-<code>snet.Path</code>; labelled <code>&lt;parent&gt;#p1..#pK</code>. The draft term for the same thing.</dd>
+<dt>SCION endpoint candidate / path set</dt>
+<dd>A dialable SCION candidate produced by <code>ExpandSCION</code>: the proto plus its ranked path set
+(up to K <code>snet.Path</code>s); labelled <code>&lt;parent&gt;#paths</code>. One QUIC connection races
+the paths of the set.</dd>
 <dt>scitra leg</dt>
 <dd>The SCION-IP-translator fallback: a proto rewritten to its mapped IPv6 address
 (<code>ScitraMap</code>, fc00::/8), dialed as ordinary IPv6. Exists only when no daemon is reachable but
@@ -1063,15 +1104,19 @@ an fc00::/8 route is. Counts as the SCION fallback, not an IP candidate, for fil
 <dd>Draft §4.2: the bounded wait (default 50ms, timer armed at the first positive answer) for the
 owner's AAAA and the service RR answers before releasing Initial candidates built from what has
 arrived.</dd>
-<dt>Expansion Delay / SCION grace</dt>
-<dd>draft-john-scion-hev3's optional hold: keep IPv6/IPv4 launches back while SCION path expansion
-is in flight, up to a bound. Implemented as the engine's grace gate
-(<code>holdForGrace</code>/<code>graceOver</code>), surfaced as <code>-scion-grace</code>. Off by default.</dd>
+<dt>Expansion Delay</dt>
+<dd>draft-john-scion-happy-eyeballs: hold the first IP attempt while a path lookup is in flight for a
+SCION endpoint that would precede it, up to 50ms by default. Implemented as the engine's grace gate
+(<code>holdForGrace</code>/<code>graceOver</code>), surfaced as <code>-expansion-delay</code> (0 = off).</dd>
+<dt>Path Delay</dt>
+<dd>The wait after adding a path of a path set to the racing QUIC attempt before adding the next:
+smoothed RTT + 2 &times; RTT variation of that path (history), else 4 &times; its declared latency, else
+50ms; within [10ms, attempt delay].</dd>
 <dt>attempt delay / stagger</dt>
 <dd>Draft §6: the interval between successive connection-attempt launches. Base default 250ms,
 hard floor 10ms (MUST), cap 2s default.</dd>
 <dt>adaptive delay</dt>
-<dd>The engine's SCION shortcut: after launching a per-path candidate with known latency L, the
+<dd>The engine's optional SCION shortcut (off by default): after launching a SCION endpoint whose top path has known latency L, the
 next stagger is <code>clamp(2L+60ms, min, base)</code> — tighten, never lengthen.</dd>
 <dt>PFC (preferred family count)</dt>
 <dd><code>-pfc</code> / <code>PreferredFamilyCount</code>: how many candidates the preferred family gets per
@@ -1083,11 +1128,8 @@ still use SVCB.</dd>
 <dt>tombstone</dt>
 <dd>An engine table entry marked <code>candDone</code> without ever launching: its label (or its proto
 parent) vanished from a later complete update set. Permanent within a run.</dd>
-<dt>fail-open</dt>
-<dd>The scion-policy rule: if thresholds would exclude <em>every</em> path, ignore the thresholds
-entirely rather than fail the candidate (draft MUST); noted on the timeline.</dd>
 <dt>dispatcherless SCION</dt>
-<dd>The lschulz/scion snet mode where the application's UDP socket <em>is</em> the SCION underlay —
+<dd>The snet mode (scionproto/scion v0.12+) where the application's UDP socket <em>is</em> the SCION underlay —
 no dispatcher daemon multiplexes ports. Consequence: the underlay UDP port is pinned, which drives
 the server's ip-h3 bind-exclusion logic.</dd>
 <dt>sciond / daemon</dt>

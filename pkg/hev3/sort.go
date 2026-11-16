@@ -1,18 +1,40 @@
 package hev3
 
 import (
+	"hash/maphash"
 	"net/netip"
 	"sort"
 )
 
-// Sort orders cands per draft-ietf-happy-happyeyeballs-v3-04 §5, extended
-// with SCION as a third address family (companion spec
-// docs/superpowers/specs/2026-07-10-scion-svcb-hev3-design.md).
+// scionOrderSeed makes the order of the SCION endpoints of one group random
+// (draft-john-scion-happy-eyeballs, "Sorting Endpoints"). It is drawn once
+// per process, so that sorting the same endpoints again (when DNS answers
+// or path lookups arrive) keeps their order.
+var scionOrderSeed = maphash.MakeSeed()
+
+func scionOrderKey(c Candidate) uint64 {
+	return maphash.String(scionOrderSeed, c.IA+","+c.Host)
+}
+
+// Sort orders cands per draft-ietf-happy-happyeyeballs-v3 §5, extended
+// with SCION as a third address family per draft-john-scion-happy-eyeballs
+// "Sorting Endpoints": SCION endpoints are ordered at random among
+// themselves, and a client with SCION connectivity (nativeSCION) orders the
+// families SCION, then the family of the first IP endpoint after
+// Destination Address Selection, then the other IP family.
 //
-// preferredFamilyCount is how many candidates the preferred family gets
-// per interleave round before ceding a turn to each other family (§5.2,
-// generalizing RFC 8305 §4's IPv6-preference interleave).
+// preferredFamilyCount is the Preferred Address Family Count (§5.3,
+// RFC 8305 §4): how many endpoints of the first family start the list
+// before the first endpoint of another family. After that leading run the
+// families take one endpoint each in turn.
 func Sort(cands []Candidate, nativeSCION bool, preferredFamilyCount int) []Candidate {
+	return SortOrder(cands, nativeSCION, preferredFamilyCount, false)
+}
+
+// SortOrder is Sort with a choice of where a client with SCION
+// connectivity orders the SCION family: first (scionLast false), or after
+// both IP families (scionLast true).
+func SortOrder(cands []Candidate, nativeSCION bool, preferredFamilyCount int, scionLast bool) []Candidate {
 	if len(cands) == 0 {
 		return nil
 	}
@@ -29,7 +51,7 @@ func Sort(cands []Candidate, nativeSCION bool, preferredFamilyCount int) []Candi
 
 	out := make([]Candidate, 0, len(cands))
 	for _, g := range groups {
-		out = append(out, sortGroup(g.members, nativeSCION, preferredFamilyCount)...)
+		out = append(out, sortGroup(g.members, nativeSCION, preferredFamilyCount, scionLast)...)
 	}
 	return out
 }
@@ -84,19 +106,40 @@ func alpnKey(alpn []string) string {
 	return key
 }
 
-// sortGroup orders one ALPN group: buckets by family, orders each bucket
-// (§5.1 Priority plus, for IP buckets, the §5.3 RFC 6724 + transport
-// ordering — see sortIPBucket), then applies the §5.2 family interleave.
-func sortGroup(members []Candidate, nativeSCION bool, preferredFamilyCount int) []Candidate {
+// sortGroup orders one ALPN group: it groups the members by service
+// priority (HEv3 §5.2), lowest value first, and orders each of these groups
+// by sortPriorityGroup.
+func sortGroup(members []Candidate, nativeSCION bool, preferredFamilyCount int, scionLast bool) []Candidate {
+	byPrio := map[uint16][]Candidate{}
+	var prios []uint16
+	for _, c := range members {
+		if _, ok := byPrio[c.Priority]; !ok {
+			prios = append(prios, c.Priority)
+		}
+		byPrio[c.Priority] = append(byPrio[c.Priority], c)
+	}
+	sort.Slice(prios, func(i, j int) bool { return prios[i] < prios[j] })
+	out := make([]Candidate, 0, len(members))
+	for _, p := range prios {
+		out = append(out, sortPriorityGroup(byPrio[p], nativeSCION, preferredFamilyCount, scionLast)...)
+	}
+	return out
+}
+
+// sortPriorityGroup orders the endpoints of one ALPN group and one service
+// priority: buckets by family, orders each bucket (SCION endpoints at
+// random; IP buckets by the §5.3 RFC 6724 + transport ordering, see
+// sortIPBucket), then applies the family interleave.
+func sortPriorityGroup(members []Candidate, nativeSCION bool, preferredFamilyCount int, scionLast bool) []Candidate {
 	buckets := make(map[Family][]Candidate, 3)
 	for _, c := range members {
 		buckets[c.Family] = append(buckets[c.Family], c)
 	}
 	for f, b := range buckets {
 		if f == FamilySCION {
-			// §5.1 priority only; stability preserves path-rank order
-			// (same-address SCION path sub-candidates arrive pre-ranked).
-			sort.SliceStable(b, func(i, j int) bool { return b[i].Priority < b[j].Priority })
+			// Endpoints without a path set (lookup in progress) last;
+			// the others at random.
+			sort.SliceStable(b, func(i, j int) bool { return scionLess(b[i], b[j]) })
 		} else {
 			sortIPBucket(b)
 		}
@@ -110,17 +153,37 @@ func sortGroup(members []Candidate, nativeSCION bool, preferredFamilyCount int) 
 	var order, trailing []Family
 	if nativeSCION {
 		order = []Family{FamilySCION, FamilyIPv6, FamilyIPv4}
+		if firstIPFamily(buckets[FamilyIPv6], buckets[FamilyIPv4]) == FamilyIPv4 {
+			order = []Family{FamilySCION, FamilyIPv4, FamilyIPv6}
+		}
+		if scionLast {
+			order = []Family{order[1], order[2], FamilySCION}
+		}
 	} else {
 		order = []Family{FamilyIPv6, FamilyIPv4}
+		if firstIPFamily(buckets[FamilyIPv6], buckets[FamilyIPv4]) == FamilyIPv4 {
+			order = []Family{FamilyIPv4, FamilyIPv6}
+		}
 		trailing = []Family{FamilySCION}
 	}
 
+	// §5.3 interleave (RFC 8305 §4), generalized to three families: the
+	// list starts with preferredFamilyCount endpoints of the first family,
+	// then the families take one endpoint each in turn. Families without
+	// endpoints are skipped, so the count applies to the family that is
+	// actually first in the list.
+	present := order[:0:0]
+	for _, f := range order {
+		if len(buckets[f]) > 0 {
+			present = append(present, f)
+		}
+	}
+	order = present
 	out := make([]Candidate, 0, len(members))
+	first := preferredFamilyCount
 	for hasRemaining(buckets, order) {
-		// Classic HEv3 interleave (RFC 8305 §4), generalized to N
-		// families: the preferred family gets preferredFamilyCount picks
-		// per round, every other family gets exactly one.
-		out = append(out, take(buckets, order[0], preferredFamilyCount)...)
+		out = append(out, take(buckets, order[0], first)...)
+		first = 1
 		for _, f := range order[1:] {
 			out = append(out, take(buckets, f, 1)...)
 		}
@@ -129,6 +192,36 @@ func sortGroup(members []Candidate, nativeSCION bool, preferredFamilyCount int) 
 		out = append(out, buckets[f]...)
 	}
 	return out
+}
+
+// scionLess orders two SCION endpoints of one group.
+func scionLess(a, b Candidate) bool {
+	if a.Priority != b.Priority {
+		return a.Priority < b.Priority
+	}
+	pa, pb := a.Path, b.Path
+	if (pa == nil) != (pb == nil) {
+		return pa != nil
+	}
+	if pa == nil {
+		return false
+	}
+	return scionOrderKey(a) < scionOrderKey(b)
+}
+
+// firstIPFamily returns the family of the first IP endpoint when the
+// (already sorted) IPv6 and IPv4 buckets are ordered together by
+// Destination Address Selection (sortIPBucket); IPv6 if there are none.
+func firstIPFamily(v6, v4 []Candidate) Family {
+	if len(v6) == 0 || len(v4) == 0 {
+		if len(v4) > 0 {
+			return FamilyIPv4
+		}
+		return FamilyIPv6
+	}
+	both := append(append([]Candidate(nil), v6...), v4...)
+	sortIPBucket(both)
+	return both[0].Family
 }
 
 func hasRemaining(buckets map[Family][]Candidate, order []Family) bool {

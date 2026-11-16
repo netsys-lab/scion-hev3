@@ -29,7 +29,7 @@ type RaceOptions struct {
 	AttemptDelay    time.Duration // stagger between launches; 0 means defaultAttemptDelay (250ms); hard-floored at 10ms, capped at MaxAttemptDelay (2s default)
 	MinAttemptDelay time.Duration // adaptive-stagger floor; 0 ⇒ 100ms; hard-floored at 10ms
 	MaxAttemptDelay time.Duration // cap on every stagger; 0 ⇒ 2s
-	NoAdaptiveDelay bool          // disable the SCION path-latency shortcut
+	AdaptiveDelay   bool          // enable the SCION path-latency shortcut (not in the draft; off by default)
 	Timeline        *Timeline     // optional; records attempt/success/fail/cancel/winner events
 }
 
@@ -54,7 +54,7 @@ func Race(ctx context.Context, cands []Candidate, dial DialFunc, o RaceOptions) 
 		delay:    o.AttemptDelay,
 		minDelay: o.MinAttemptDelay,
 		maxDelay: o.MaxAttemptDelay,
-		adaptive: !o.NoAdaptiveDelay,
+		adaptive: o.AdaptiveDelay,
 		tl:       o.Timeline,
 	})
 }

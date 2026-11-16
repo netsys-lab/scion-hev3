@@ -1,6 +1,11 @@
-// Package hev3 implements a SCION-aware Happy Eyeballs v3 dialer, per
-// draft-ietf-happy-happyeyeballs-v3-04 extended with SCION as a third
-// address family (see docs/superpowers/specs/2026-07-10-scion-svcb-hev3-design.md).
+// Package hev3 implements a SCION-aware Happy Eyeballs v3 dialer:
+// draft-ietf-happy-happyeyeballs-v3 extended with SCION as a third address
+// family per draft-john-scion-happy-eyeballs. SCION addresses come from the
+// `scion` SvcParam of draft-john-scion-svcb. A SCION address is one endpoint.
+// A connection attempt to it selects up to Path Attempt Count paths
+// (pathset.go) and starts a separate QUIC connection on each, one Path
+// Attempt Delay apart (attempts.go). The earlier design, one QUIC connection
+// copied onto several paths (racer.go), remains as PathModeCopy.
 package hev3
 
 import "time"
@@ -14,49 +19,29 @@ const (
 	FamilyIPv4
 )
 
-// PolicyMetric is a path selection metric a scion-policy SvcParam can
-// express a preference over.
-type PolicyMetric int
-
-const (
-	// MetricLatency prefers lowest summed advertised latency.
-	MetricLatency PolicyMetric = iota
-	// MetricBandwidth prefers highest bottleneck (minimum hop) bandwidth.
-	MetricBandwidth
-	// MetricHops prefers fewest interfaces/hops.
-	MetricHops
-)
-
-// PathPolicy is the client-side view of a scion-policy SvcParam
-// (draft-john-scion-svcb §4): ordered preference metrics plus optional
-// threshold filters. Zero thresholds mean "no threshold".
-type PathPolicy struct {
-	Prefer           []PolicyMetric
-	MaxLatency       time.Duration
-	MinBandwidthKbps uint64
-}
-
-// SCIONPath describes one ranked SCION path to a destination.
+// SCIONPath describes one path of a SCION endpoint's ranked path set
+// (pathset.go).
 type SCIONPath struct {
 	Fingerprint string
-	Latency     time.Duration
-	Hops        int
-	SNET        any // holds snet.Path; typed as any so pure-logic packages need no scionproto import
+	Latency     time.Duration // summed declared latency; 0 = unknown (no entry set)
+	Hops        int           // AS hops: ASes on the path (pathASHops)
+	Interfaces  string        // human-readable interface sequence, for stats
+	Down        bool          // ranked last: traverses an interface in the SCMP down cache
+	SNET        any           // holds snet.Path; typed as any so pure-logic packages need no scionproto import
 }
 
 // Candidate is one dialable destination: an IP address+port, or a SCION
-// address+path. Multiple Candidates may share the same IA/Host when they
-// represent distinct ranked SCION paths (see Path).
+// endpoint (address+port) with its ranked path set.
 type Candidate struct {
 	Family    Family
 	Host      string // IP literal, or SCION host IP
 	Port      uint16
 	IA        string      // "1-150"; empty for IP families
-	Path      *SCIONPath  // nil for IP families and the scitra leg
+	Path      *SCIONPath  // top-ranked path of PathSet (== &PathSet[0]); nil for IP families, the scitra leg and unexpanded SCION endpoints
+	PathSet   []SCIONPath // ranked path set, at most K paths (draft-john-scion-happy-eyeballs Path Selection)
 	ViaScitra bool        // SCION-derived candidate dialed as mapped IPv6
-	ALPN      []string    // from SVCB; empty = default (https ⇒ try h2/h1.1 TCP)
-	GroupALPN []string    // the covering record's full supported ALPN set, used for §5.1 grouping; nil = group by ALPN
+	ALPN      []string    // from SVCB; empty = default (https => try h2/h1.1 TCP)
+	GroupALPN []string    // the covering record's full supported ALPN set, used for Sec 5.1 grouping; nil = group by ALPN
 	Priority  uint16      // SvcPriority
-	Label     string      // stable human id, e.g. "scion:1-150#p1", "v6:2001:db8::1", "v4+tcp:…"
-	Policy    *PathPolicy // scion-policy hint from the covering service record; nil = none (SCION candidates only)
+	Label     string      // stable human id, e.g. "scion:1-150,10.0.0.1#paths", "v6:2001:db8::1", "v4+tcp:..."
 }

@@ -4,8 +4,8 @@ go 1.26.4
 
 require (
 	github.com/miekg/dns v0.0.0-00010101000000-000000000000
-	github.com/quic-go/quic-go v0.57.0
-	github.com/scionproto/scion v0.11.0
+	github.com/quic-go/quic-go v0.59.1
+	github.com/scionproto/scion v0.15.1
 	golang.org/x/net v0.56.0
 )
 
@@ -18,8 +18,6 @@ require (
 	github.com/grpc-ecosystem/go-grpc-middleware v1.4.0 // indirect
 	github.com/grpc-ecosystem/go-grpc-prometheus v1.2.0 // indirect
 	github.com/grpc-ecosystem/grpc-opentracing v0.0.0-20180507213350-8e809c8a8645 // indirect
-	github.com/hashicorp/golang-lru/arc/v2 v2.0.7 // indirect
-	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
 	github.com/iancoleman/strcase v0.3.0 // indirect
 	github.com/mattn/go-sqlite3 v1.14.37 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
@@ -43,14 +41,11 @@ require (
 	golang.org/x/sys v0.46.0 // indirect
 	golang.org/x/text v0.38.0 // indirect
 	golang.org/x/tools v0.47.0 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20251202230838-ff82c1b0f217 // indirect
-	google.golang.org/grpc v1.79.3 // indirect
-	google.golang.org/protobuf v1.36.10 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260414002931-afd174a4e478 // indirect
+	google.golang.org/grpc v1.82.1 // indirect
+	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
-	lukechampine.com/frand v1.5.1 // indirect
 	zgo.at/zcache/v2 v2.1.0 // indirect
 )
 
-replace github.com/miekg/dns => github.com/netsys-lab/dns-scion-svcb v0.0.0-20260719065454-e94f8373acf8
-
-replace github.com/scionproto/scion => github.com/lschulz/scion v0.11.1-0.20260709203036-e356d834bba6
+replace github.com/miekg/dns => github.com/netsys-lab/dns-scion-svcb v0.0.0-20261111200431-69d4ec790b66

@@ -1,9 +1,27 @@
 package hev3
 
 import (
+	"hash/maphash"
+	"net/netip"
 	"reflect"
+	"strings"
 	"testing"
 )
+
+// bothFamiliesReachable stubs udpSource so every IPv6 and IPv4 destination
+// is reachable from a global source of its family: RFC 6724 then puts IPv6
+// first (higher precedence) independent of the test host's routes.
+func bothFamiliesReachable(t *testing.T) {
+	t.Helper()
+	old := udpSource
+	t.Cleanup(func() { udpSource = old })
+	udpSource = func(dst netip.Addr) netip.Addr {
+		if dst.Unmap().Is4() {
+			return netip.MustParseAddr("198.51.100.1")
+		}
+		return netip.MustParseAddr("2001:db8:ffff::1")
+	}
+}
 
 func labels(cands []Candidate) []string {
 	out := make([]string, len(cands))
@@ -16,6 +34,7 @@ func labels(cands []Candidate) []string {
 // worked example, brief step 2: {v4a,v6a,scion-p1,scion-p2,v6b}, nativeSCION=true,
 // preferredFamilyCount=1 -> SCION,IPv6,IPv4 preference, round-robin interleave.
 func TestSort_FamilyInterleave_NativeSCION(t *testing.T) {
+	bothFamiliesReachable(t)
 	v4a := Candidate{Family: FamilyIPv4, Host: "203.0.113.1", Priority: 1, Label: "v4a"}
 	v6a := Candidate{Family: FamilyIPv6, Host: "2001:db8::1", Priority: 1, Label: "v6a"}
 	v6b := Candidate{Family: FamilyIPv6, Host: "2001:db8::2", Priority: 1, Label: "v6b"}
@@ -69,6 +88,7 @@ func TestSort_SCIONPathOrderPreserved(t *testing.T) {
 
 // nativeSCION=false: preference order is IPv6, IPv4 (no SCION-first).
 func TestSort_NonNativeSCION_IPv6First(t *testing.T) {
+	bothFamiliesReachable(t)
 	v4a := Candidate{Family: FamilyIPv4, Host: "203.0.113.1", Priority: 1, Label: "v4a"}
 	v6a := Candidate{Family: FamilyIPv6, Host: "2001:db8::1", Priority: 1, Label: "v6a"}
 
@@ -82,6 +102,7 @@ func TestSort_NonNativeSCION_IPv6First(t *testing.T) {
 // ViaScitra candidates dial as IPv6 (belong to FamilyIPv6 for interleaving)
 // but must tie-break after real IPv6 candidates at equal priority.
 func TestSort_ScitraTiebreakAfterRealIPv6(t *testing.T) {
+	bothFamiliesReachable(t)
 	scitra := Candidate{Family: FamilyIPv6, Host: "fc00:961:9600::1", Priority: 1, ViaScitra: true, Label: "scitra"}
 	realV6 := Candidate{Family: FamilyIPv6, Host: "2001:db8::1", Priority: 1, ViaScitra: false, Label: "realv6"}
 	v4a := Candidate{Family: FamilyIPv4, Host: "203.0.113.1", Priority: 1, Label: "v4a"}
@@ -97,6 +118,7 @@ func TestSort_ScitraTiebreakAfterRealIPv6(t *testing.T) {
 // nativeSCION=false with a stray SCION candidate present (should not happen
 // in practice, but the sorter must not drop or crash on it): sorts last.
 func TestSort_NonNativeSCION_StraySCIONSortsLast(t *testing.T) {
+	bothFamiliesReachable(t)
 	v4a := Candidate{Family: FamilyIPv4, Host: "203.0.113.1", Priority: 1, Label: "v4a"}
 	v6a := Candidate{Family: FamilyIPv6, Host: "2001:db8::1", Priority: 1, Label: "v6a"}
 	stray := Candidate{Family: FamilySCION, IA: "1-150", Priority: 1, Label: "stray", Path: &SCIONPath{Fingerprint: "x"}}
@@ -122,31 +144,78 @@ func TestSort_StableForEqualKeys(t *testing.T) {
 	}
 }
 
-// preferredFamilyCount > 1: the preferred family gets N picks per round
-// before the round robins through the remaining families once each.
+// HEv3 §5.3 Preferred Address Family Count above 1: the list starts with
+// that many endpoints of the first family; after that leading run the
+// families take one endpoint each in turn.
 func TestSort_PreferredFamilyCountAboveOne(t *testing.T) {
-	s1 := Candidate{Family: FamilySCION, IA: "1-150", Priority: 1, Label: "s1", Path: &SCIONPath{Fingerprint: "1"}}
-	s2 := Candidate{Family: FamilySCION, IA: "1-150", Priority: 1, Label: "s2", Path: &SCIONPath{Fingerprint: "2"}}
-	s3 := Candidate{Family: FamilySCION, IA: "1-150", Priority: 1, Label: "s3", Path: &SCIONPath{Fingerprint: "3"}}
-	v6a := Candidate{Family: FamilyIPv6, Host: "2001:db8::1", Priority: 1, Label: "v6a"}
-	v4a := Candidate{Family: FamilyIPv4, Host: "203.0.113.1", Priority: 1, Label: "v4a"}
+	bothFamiliesReachable(t)
+	// SCION endpoints share IA and host, so their random order key is
+	// equal and they keep their input order.
+	s := func(l string) Candidate {
+		return Candidate{Family: FamilySCION, IA: "1-150", Priority: 1, Label: l, Path: &SCIONPath{Fingerprint: l}}
+	}
+	x := func(l, host string) Candidate {
+		return Candidate{Family: FamilyIPv6, Host: host, Priority: 1, Label: l}
+	}
+	y := func(l, host string) Candidate {
+		return Candidate{Family: FamilyIPv4, Host: host, Priority: 1, Label: l}
+	}
+	x1, x2, x3, x4 := x("x1", "2001:db8::1"), x("x2", "2001:db8::2"), x("x3", "2001:db8::3"), x("x4", "2001:db8::4")
+	y1, y2 := y("y1", "203.0.113.1"), y("y2", "203.0.113.2")
 
-	got := Sort([]Candidate{v4a, v6a, s1, s2, s3}, true, 2)
-	want := []string{"s1", "s2", "v6a", "v4a", "s3"}
-	if g := labels(got); !reflect.DeepEqual(g, want) {
-		t.Fatalf("got %v, want %v", g, want)
+	cases := []struct {
+		name      string
+		in        []Candidate
+		scionLast bool
+		want      []string
+	}{
+		{
+			name: "SCION first, short",
+			in:   []Candidate{y1, x1, s("s1"), s("s2"), s("s3")},
+			want: []string{"s1", "s2", "x1", "y1", "s3"},
+		},
+		{
+			// N endpoints of the first family only at the start; N in
+			// every round would give s1 s2 x1 y1 s3 s4 x2 y2.
+			name: "SCION first, four SCION endpoints",
+			in:   []Candidate{y1, y2, x1, x2, s("s1"), s("s2"), s("s3"), s("s4")},
+			want: []string{"s1", "s2", "x1", "y1", "s3", "x2", "y2", "s4"},
+		},
+		{
+			// The first family is IPv6; N in every round would give
+			// x1 x2 y1 s1 x3 x4 y2 s2.
+			name:      "SCION last, four IPv6 endpoints",
+			in:        []Candidate{s("s1"), s("s2"), y1, y2, x1, x2, x3, x4},
+			scionLast: true,
+			want:      []string{"x1", "x2", "y1", "s1", "x3", "y2", "s2", "x4"},
+		},
+		{
+			// No SCION endpoint: the count applies to IPv6, the family
+			// that is first in the list.
+			name: "SCION first, no SCION endpoints",
+			in:   []Candidate{y1, y2, x1, x2, x3},
+			want: []string{"x1", "x2", "y1", "x3", "y2"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := labels(SortOrder(tc.in, true, 2, tc.scionLast))
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
-// §5.2 regression: the family interleave outranks Priority *within* a group.
-// A high-priority-number SCION candidate still precedes a low-number IPv4 one
-// because SCION is the preferred family (nativeSCION), not because of Priority.
-func TestSort_FamilyInterleaveOverridesPriorityWithinGroup(t *testing.T) {
+// HEv3 §5.2: endpoints are grouped by service priority before the families
+// are interleaved. A SCION endpoint of a priority-9 record comes after an
+// IPv4 endpoint of a priority-1 record, although SCION is the first family.
+func TestSort_ServicePriorityBeforeFamilyInterleave(t *testing.T) {
 	v4 := Candidate{Family: FamilyIPv4, Host: "203.0.113.1", Priority: 1, Label: "v4"}
 	scion := Candidate{Family: FamilySCION, IA: "1-150", Priority: 9, Label: "scion", Path: &SCIONPath{Fingerprint: "p"}}
 
-	got := Sort([]Candidate{v4, scion}, true, 1)
-	want := []string{"scion", "v4"}
+	got := Sort([]Candidate{scion, v4}, true, 1)
+	want := []string{"v4", "scion"}
 	if g := labels(got); !reflect.DeepEqual(g, want) {
 		t.Fatalf("got %v, want %v", g, want)
 	}
@@ -282,5 +351,54 @@ func TestSort_ComparatorRepairsTransportInvertedInput(t *testing.T) {
 	want := []string{"a1-h3", "a1-tcp", "a2-h3", "a2-tcp"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("Sort (transport-inverted input) = %v, want %v (comparator must repair, not just preserve)", got, want)
+	}
+}
+
+// draft-john-scion-happy-eyeballs, Sorting Endpoints: with SCION
+// connectivity, the family after SCION is the family of the first IP
+// endpoint after Destination Address Selection - here IPv4, because the
+// IPv6 address is unreachable (RFC 6724 rule 1).
+func TestSort_NativeSCION_SecondFamilyFromRFC6724(t *testing.T) {
+	old := udpSource
+	defer func() { udpSource = old }()
+	udpSource = fixedSource(map[string]string{"203.0.113.1": "198.51.100.1"})
+	v6 := Candidate{Family: FamilyIPv6, Host: "2001:db8::1", Label: "v6"}
+	v6b := Candidate{Family: FamilyIPv6, Host: "2001:db8::2", Label: "v6b"}
+	v4 := Candidate{Family: FamilyIPv4, Host: "203.0.113.1", Label: "v4"}
+	sc := Candidate{Family: FamilySCION, IA: "1-150", Label: "sc", Path: &SCIONPath{Hops: 2}}
+	got := labels(Sort([]Candidate{v6, v6b, v4, sc}, true, 1))
+	want := []string{"sc", "v4", "v6", "v6b"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
+// SCION endpoints of one group are ordered at random among themselves:
+// the order is the same when the same endpoints are sorted again, differs
+// between seeds, and endpoints whose lookup is in progress (no path) are last.
+func TestSort_SCIONEndpointsRandom(t *testing.T) {
+	mk := func(host string, p *SCIONPath) Candidate {
+		return Candidate{Family: FamilySCION, IA: "1-150", Host: host, Label: host, Path: p}
+	}
+	in := []Candidate{mk("proto", nil)}
+	for _, h := range []string{"a", "b", "c", "d", "e", "f", "g", "h"} {
+		in = append(in, mk(h, &SCIONPath{Hops: 2}))
+	}
+	old := scionOrderSeed
+	defer func() { scionOrderSeed = old }()
+	orders := map[string]bool{}
+	for i := 0; i < 20; i++ {
+		scionOrderSeed = maphash.MakeSeed()
+		got := labels(Sort(in, true, 1))
+		if again := labels(Sort(in, true, 1)); !reflect.DeepEqual(got, again) {
+			t.Fatalf("order changed between two sorts: %v, %v", got, again)
+		}
+		if len(got) != len(in) || got[len(got)-1] != "proto" {
+			t.Fatalf("got %v, want the endpoint without a path last", got)
+		}
+		orders[strings.Join(got, ",")] = true
+	}
+	if len(orders) < 2 {
+		t.Fatalf("20 seeds gave one order: %v", orders)
 	}
 }

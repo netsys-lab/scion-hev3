@@ -23,7 +23,7 @@ import (
 // expiry releases Initial from whatever has answered so far. Queries
 // still outstanding at release (any of HTTPS/SVCB/AAAA/A) keep running
 // and merge their answers via Updates (§4.3).
-const defaultResolutionDelay = 50 * time.Millisecond
+const defaultResolutionDelay = 25 * time.Millisecond
 
 // queryTimeout bounds one per-server network attempt (UDP, or the TCP retry
 // after truncation) within an exchange; a full exchange may take up to
@@ -38,22 +38,27 @@ const maxAliasChase = 4
 // ResolveOptions tunes ResolveHost. The zero value is valid.
 type ResolveOptions struct {
 	Resolver        string        // "ip:53"[,"ip:53"...]; empty ⇒ system resolver via /etc/resolv.conf. Comma-separated servers are tried in order (F9 failover); each element is already "host:port".
-	ResolutionDelay time.Duration // 0 ⇒ defaultResolutionDelay (50ms)
-	Timeline        *Timeline     // optional; records query/answer/candidate events
-	RRType          RRType        // which service-binding RR type(s) to query; 0 (RRBoth) is the default
-	ShuffleSeed     int64         // seeds the equal-priority record shuffle (§5.2); 0 ⇒ a fresh crypto/rand seed per run. Fix it in tests for a deterministic order.
+	ResolutionDelay time.Duration // 0 ⇒ defaultResolutionDelay (25ms)
+	// SCIONFirst releases the SCION endpoints of the service answer as soon
+	// as that answer is final, without waiting for the address answers, so
+	// their path lookups start at once. IP endpoints are released as usual.
+	SCIONFirst  bool
+	Timeline    *Timeline // optional; records query/answer/candidate events
+	RRType      RRType    // which service-binding RR type(s) to query; 0 (RRHTTPS) is the default
+	ShuffleSeed int64     // seeds the equal-priority record shuffle (§5.2); 0 ⇒ a fresh crypto/rand seed per run. Fix it in tests for a deterministic order.
 }
 
 // RRType selects which service-binding RR type(s) ResolveHost queries.
-// RRBoth (the zero value) queries HTTPS and SVCB in parallel and prefers
-// HTTPS answers — the migration default while deployed zones still use
-// SVCB; draft-ietf-happy-happyeyeballs-v3-04 §4.1 wants HTTPS for HTTP(S)
-// clients.
+// RRHTTPS (the zero value) sends the one HTTPS query that an https URL maps
+// to (Section 4.1 of draft-ietf-happy-happyeyeballs-v3; the SCION draft adds
+// no other DNS queries). RRSVCB queries SVCB instead. RRBoth queries HTTPS
+// and SVCB in parallel and prefers HTTPS answers, for zones that publish
+// only SVCB records; it is not in the draft.
 type RRType int
 
 const (
-	RRBoth RRType = iota
-	RRHTTPS
+	RRHTTPS RRType = iota
+	RRBoth
 	RRSVCB
 )
 
@@ -117,6 +122,20 @@ type Resolved struct {
 	Initial []Candidate
 	Updates <-chan []Candidate
 	ttl     *atomic.Int64 // smallest contributing TTL, nanoseconds; 0 = unknown
+	firstIP *atomic.Int64 // UnixNano of the first positive IP answer; 0 = none yet
+}
+
+// FirstIPAnswer returns when the first positive IP answer (a non-empty A or
+// AAAA answer, or a service record with an address hint) arrived; the zero
+// time if none has.
+func (r Resolved) FirstIPAnswer() time.Time {
+	if r.firstIP == nil {
+		return time.Time{}
+	}
+	if ns := r.firstIP.Load(); ns != 0 {
+		return time.Unix(0, ns)
+	}
+	return time.Time{}
 }
 
 // ResolveHost issues service (HTTPS and/or SVCB per o.RRType), AAAA and A
@@ -145,22 +164,24 @@ func ResolveHost(ctx context.Context, host string, port uint16, o ResolveOptions
 
 	ttl := &atomic.Int64{}
 	r := &resolveRun{
-		ctx:     ctx,
-		servers: servers,
-		host:    dns.CanonicalName(host),
-		port:    port,
-		tl:      o.Timeline,
-		rrType:  o.RRType,
-		rng:     rand.New(rand.NewPCG(uint64(seed), uint64(seed))),
-		ttl:     ttl,
-		initial: make(chan []Candidate, 1),
-		updates: make(chan []Candidate),
+		ctx:        ctx,
+		servers:    servers,
+		host:       dns.CanonicalName(host),
+		port:       port,
+		tl:         o.Timeline,
+		rrType:     o.RRType,
+		rng:        rand.New(rand.NewPCG(uint64(seed), uint64(seed))),
+		ttl:        ttl,
+		firstIP:    &atomic.Int64{},
+		scionFirst: o.SCIONFirst,
+		initial:    make(chan []Candidate, 1),
+		updates:    make(chan []Candidate),
 	}
 	go r.run(delay)
 
 	select {
 	case cands := <-r.initial:
-		return Resolved{Initial: cands, Updates: r.updates, ttl: ttl}, nil
+		return Resolved{Initial: cands, Updates: r.updates, ttl: ttl, firstIP: r.firstIP}, nil
 	case <-ctx.Done():
 		return Resolved{}, ctx.Err()
 	}
@@ -207,15 +228,17 @@ func resolverAddresses(resolver string) ([]string, error) {
 // (HTTPS/SVCB), owner and TargetName AAAA/A queries and any service-record
 // alias chase.
 type resolveRun struct {
-	ctx     context.Context
-	servers []string
-	host    string
-	port    uint16
-	tl      *Timeline
-	rrType  RRType
-	rng     *rand.Rand      // run-stable; seeds the §5.2 equal-priority shuffle
-	noted   map[string]bool // keys already recorded via noteOnce (dedup across rebuilds)
-	ttl     *atomic.Int64   // smallest contributing TTL, nanoseconds; 0 = unknown
+	ctx        context.Context
+	servers    []string
+	host       string
+	port       uint16
+	tl         *Timeline
+	rrType     RRType
+	rng        *rand.Rand      // run-stable; seeds the §5.2 equal-priority shuffle
+	noted      map[string]bool // keys already recorded via noteOnce (dedup across rebuilds)
+	ttl        *atomic.Int64   // smallest contributing TTL, nanoseconds; 0 = unknown
+	firstIP    *atomic.Int64   // UnixNano of the first positive IP answer
+	scionFirst bool
 
 	initial chan []Candidate
 	updates chan []Candidate
@@ -340,6 +363,19 @@ func (r *resolveRun) run(delay time.Duration) {
 		}
 		return false
 	}
+	positiveIP := func() bool {
+		for _, p := range addrs {
+			if (p.aaaa.final && len(p.aaaa.ips) > 0) || (p.a.final && len(p.a.ips) > 0) {
+				return true
+			}
+		}
+		for _, rec := range chosen() {
+			if len(rec.hint4) > 0 || len(rec.hint6) > 0 {
+				return true
+			}
+		}
+		return false
+	}
 	ownerAAAAFinal := func() bool { return addrs[r.host].aaaa.final }
 
 	// release checks the §4.2 gate: proceed once at least one positive answer
@@ -357,15 +393,30 @@ func (r *resolveRun) run(delay time.Duration) {
 	// (see the Resolved doc comment for the abandon-without-cancel case).
 	release := func() {
 		allFinal := outstanding == 0
+		scionOnly := false
 		if !allFinal {
-			if !positive() {
-				return
-			}
-			if !(ownerAAAAFinal() && serviceFinal()) && !delayElapsed {
-				return
+			if !positive() || (!(ownerAAAAFinal() && serviceFinal()) && !delayElapsed) {
+				// The gate holds. A SCION-first client still gets the
+				// SCION endpoints of a final service answer.
+				if !r.scionFirst || !serviceFinal() {
+					return
+				}
+				scionOnly = true
 			}
 		}
 		cands := r.buildCandidates(chosen(), addrs)
+		if scionOnly {
+			var sc []Candidate
+			for _, c := range cands {
+				if c.Family == FamilySCION {
+					sc = append(sc, c)
+				}
+			}
+			if len(sc) == 0 {
+				return
+			}
+			cands = sc
+		}
 		if !sent {
 			sent = true
 			r.emitNewCandidates(nil, cands)
@@ -416,6 +467,9 @@ func (r *resolveRun) run(delay time.Duration) {
 				} else {
 					p.a = addrState{ips: res.ips, final: true}
 				}
+			}
+			if r.firstIP.Load() == 0 && positiveIP() {
+				r.firstIP.Store(time.Now().UnixNano())
 			}
 			if !timerArmed && positive() && !(ownerAAAAFinal() && serviceFinal()) {
 				timer.Reset(delay)
@@ -654,6 +708,9 @@ func (r *resolveRun) buildCandidates(recs []*svcRecord, addrs map[string]*addrPa
 		return out
 	}
 	covered := false
+	// scionLabels holds the labels of the SCION endpoints emitted so far, so
+	// that the same address in several records yields distinct endpoints.
+	scionLabels := map[string]bool{}
 	// emitted tracks TargetNames whose IP addresses (and hints) have already
 	// been emitted, so a name shared by several records contributes its
 	// A/AAAA exactly once, under the lowest-priority covering record.
@@ -662,7 +719,7 @@ func (r *resolveRun) buildCandidates(recs []*svcRecord, addrs map[string]*addrPa
 		if rec.target == r.host {
 			covered = true
 		}
-		out = append(out, r.recordCandidates(rec, addrs, emitted)...)
+		out = append(out, r.recordCandidates(rec, addrs, emitted, scionLabels)...)
 	}
 	if !covered {
 		if pair := addrs[r.host]; pair != nil {
@@ -690,7 +747,7 @@ func (r *resolveRun) buildCandidates(recs []*svcRecord, addrs map[string]*addrPa
 // (F8). Both carry the record's port (falling back to the caller's default)
 // and priority. A record offering no client-supported ALPN contributes
 // nothing at all (draft §6.2).
-func (r *resolveRun) recordCandidates(rec *svcRecord, addrs map[string]*addrPair, emitted map[string]bool) []Candidate {
+func (r *resolveRun) recordCandidates(rec *svcRecord, addrs map[string]*addrPair, emitted, scionLabels map[string]bool) []Candidate {
 	supported := rec.supportedALPN()
 	if len(supported) == 0 {
 		r.noteOnce("alpn:"+rec.target, "svcb "+rec.target, "no client-supported ALPN")
@@ -723,14 +780,13 @@ func (r *resolveRun) recordCandidates(rec *svcRecord, addrs map[string]*addrPair
 			ALPN:      supported,
 			GroupALPN: supported,
 			Priority:  rec.prio,
-			Policy:    rec.policy,
 			// Label uses the same canonical scionIA form as IA, not
 			// addr.String(): the latter renders a wire-round-tripped
 			// hex-range ASN in decimal (SVCBScion's wire pack/unpack loses
 			// the hex-presentation bit — see scionIA's doc comment), which
 			// would make Label disagree with IA for the exact deployed
 			// zone's "games" record.
-			Label: "scion:" + ia + "," + addr.Host.String(),
+			Label: scionLabel(ia, addr.Host.String(), port, rec.prio, scionLabels),
 		})
 	}
 	if emitted[rec.target] {
@@ -768,6 +824,26 @@ func (r *resolveRun) recordCandidates(rec *svcRecord, addrs map[string]*addrPair
 		}
 	}
 	return out
+}
+
+// scionLabel returns the label of a SCION endpoint and marks it used. The
+// label is "scion:IA,host". The draft makes each usable SCION address of
+// each ServiceMode record an endpoint of its own, so when an earlier record
+// of the same set already yielded that label (the same address with another
+// port, priority or ALPN set), the label becomes "scion:IA,host@port/pPRIO",
+// with "/N" appended if that is taken too. Records are ordered once per
+// resolution, so a label stays the same across rebuilds of the set.
+func scionLabel(ia, host string, port, prio uint16, used map[string]bool) string {
+	lbl := "scion:" + ia + "," + host
+	if used[lbl] {
+		base := fmt.Sprintf("%s@%d/p%d", lbl, port, prio)
+		lbl = base
+		for n := 2; used[lbl]; n++ {
+			lbl = fmt.Sprintf("%s/%d", base, n)
+		}
+	}
+	used[lbl] = true
+	return lbl
 }
 
 // tcpALPN strips h3 (UDP-only) from the supported set for the TCP leg.
@@ -866,7 +942,6 @@ type svcRecord struct {
 	alpn      []string
 	noDefault bool
 	scion     []dns.SCIONAddr
-	policy    *PathPolicy
 	hint4     []net.IP
 	hint6     []net.IP
 }
@@ -880,7 +955,6 @@ var supportedParams = map[dns.SVCBKey]bool{
 	dns.SVCB_IPV4HINT:        true,
 	dns.SVCB_IPV6HINT:        true,
 	dns.SVCB_SCION:           true,
-	dns.SVCB_SCION_POLICY:    true,
 }
 
 // parseServiceRecord flattens one ServiceMode record. owner is the FQDN
@@ -906,9 +980,17 @@ func parseServiceRecord(rr *dns.SVCB, owner string) (*svcRecord, error) {
 		case *dns.SVCBNoDefaultAlpn:
 			rec.noDefault = true
 		case *dns.SVCBScion:
-			rec.scion = kv.Addrs
-		case *dns.SVCBScionPolicy:
-			rec.policy = pathPolicyFrom(kv)
+			// Only distinct usable SCION addresses yield endpoints
+			// (draft-john-scion-svcb, Section 3.3.1).
+			rec.scion = rec.scion[:0]
+			seen := map[dns.SCIONAddr]bool{}
+			for _, a := range kv.Addrs {
+				if a.IsUnusable() || seen[a] {
+					continue
+				}
+				seen[a] = true
+				rec.scion = append(rec.scion, a)
+			}
 		case *dns.SVCBIPv4Hint:
 			rec.hint4 = kv.Hint
 		case *dns.SVCBIPv6Hint:
@@ -941,38 +1023,4 @@ func (rec *svcRecord) supportedALPN() []string {
 		}
 	}
 	return out
-}
-
-// pathPolicyFrom converts the wire SvcParam to the client-side PathPolicy.
-// Duplicate metrics/thresholds keep the first occurrence (draft §4 wire
-// format rules). A policy with no usable items collapses to nil.
-func pathPolicyFrom(v *dns.SVCBScionPolicy) *PathPolicy {
-	metric := map[dns.PolicyMetric]PolicyMetric{
-		dns.PolicyMetricLatency:   MetricLatency,
-		dns.PolicyMetricBandwidth: MetricBandwidth,
-		dns.PolicyMetricHops:      MetricHops,
-	}
-	p := &PathPolicy{}
-	seen := map[PolicyMetric]bool{}
-	for _, it := range v.Items {
-		switch {
-		case it.Prefer != nil:
-			if m, ok := metric[*it.Prefer]; ok && !seen[m] {
-				seen[m] = true
-				p.Prefer = append(p.Prefer, m)
-			}
-		case it.MaxLatencyUs != nil:
-			if p.MaxLatency == 0 {
-				p.MaxLatency = time.Duration(*it.MaxLatencyUs) * time.Microsecond
-			}
-		case it.MinBandwidthKbps != nil:
-			if p.MinBandwidthKbps == 0 {
-				p.MinBandwidthKbps = uint64(*it.MinBandwidthKbps)
-			}
-		}
-	}
-	if len(p.Prefer) == 0 && p.MaxLatency == 0 && p.MinBandwidthKbps == 0 {
-		return nil
-	}
-	return p
 }

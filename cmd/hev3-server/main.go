@@ -53,8 +53,20 @@ func run(args []string, stderr *os.File) int {
 	scionIPFlag := fs.String("scion-ip", "", "SCION underlay bind IP for -scion (default: auto via sciond)")
 	daemonAddr := fs.String("daemon", "", "sciond address for -scion (default $SCION_DAEMON_ADDRESS or 127.0.0.1:30255)")
 
+	connLogFile := fs.String("conn-log", "", "append one JSON line per ended QUIC connection of the -scion listener to this file (lifetime, packets, octets, how it was closed)")
+
 	if err := fs.Parse(args); err != nil {
 		return 2
+	}
+	var cl *connLog
+	if *connLogFile != "" {
+		f, err := os.OpenFile(*connLogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			fmt.Fprintf(stderr, "hev3-server: -conn-log: %v\n", err)
+			return 1
+		}
+		defer f.Close()
+		cl = &connLog{w: f}
 	}
 
 	excludeIPs, err := parseExcludeIPs(*listenExclude)
@@ -83,7 +95,7 @@ func run(args []string, stderr *os.File) int {
 	var servers []*server
 	var scionIP netip.Addr
 	if *useSCION {
-		sc, err := newSCIONServer(context.Background(), withTransport(transportSCION, handler), cert, resolveDaemon(*daemonAddr), *scionIPFlag, *scionPort)
+		sc, err := newSCIONServer(context.Background(), withTransport(transportSCION, handler), cert, resolveDaemon(*daemonAddr), *scionIPFlag, *scionPort, cl)
 		if err != nil {
 			fmt.Fprintf(stderr, "hev3-server: setting up SCION listener: %v\n", err)
 			return 1

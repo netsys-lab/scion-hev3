@@ -1,8 +1,12 @@
 // Command hev3 is the SCION-aware Happy Eyeballs v3 CLI: it fetches one
-// https:// URL, racing SCION/IPv6/IPv4 candidates per
-// draft-ietf-happy-happyeyeballs-v3-04 (extended with SCION — see
-// docs/superpowers/specs/2026-07-10-scion-svcb-hev3-design.md), and prints
-// either a human race table + response preview or a JSON summary.
+// https:// URL, racing SCION/IPv6/IPv4 endpoints per
+// draft-ietf-happy-happyeyeballs-v3 as extended by
+// draft-john-scion-happy-eyeballs (a SCION endpoint is attempted over up
+// to -k candidate paths, each attempt a QUIC connection of its own, started
+// -path-attempt-delay apart), and prints either a human race table +
+// response preview or a JSON summary. -repeat runs the fetch several times
+// in one process (fresh connections, shared SCION daemon connection);
+// -stats prints per-run SCION path lookup and path attempt statistics.
 package main
 
 import (
@@ -35,21 +39,34 @@ func run(args []string, stdout, stderr *os.File) int {
 	}
 
 	resolver := fs.String("resolver", "", "DNS resolver \"ip:port\"; empty = system resolver (/etc/resolv.conf)")
-	k := fs.Int("k", 0, "ranked SCION paths kept per SCION candidate (0 = library default)")
+	k := fs.Int("k", 2, "Path Attempt Count: the most candidate paths attempted for one SCION endpoint")
+	pathAttemptDelay := fs.Duration("path-attempt-delay", 50*time.Millisecond, "Path Attempt Delay: time between the starts of the attempts over the candidate paths of one SCION endpoint (at least 10ms, at most the Connection Attempt Delay)")
+	pathMode := fs.String("path-mode", "attempts", `how the candidate paths of a SCION endpoint are used: "attempts" (a separate QUIC connection per path) or "copy" (one QUIC connection, datagrams copied to the paths; not in the draft)`)
+	familyOrder := fs.String("family-order", "scion-first", `where the SCION family is ordered: "scion-first" or "ip-first" (SCION after both IP families; path lookups are not waited for)`)
+	linger := fs.Duration("linger", 0, "how long a cancelled path attempt may go on so that it can be closed with CONNECTION_CLOSE (0 = twice the time the attempts took, within 50ms..1s; negative = drop at once)")
+	fixedPaths := fs.Bool("deterministic-paths", false, "break ties in the candidate path selection by declared latency and fingerprint instead of at random")
+	pathDelay := fs.String("path-delay", "auto", `-path-mode=copy only: delay between adding paths: "auto" (smoothed RTT + 2*RTT variation of the path from history, else 4x its declared latency, else 50ms), a fixed duration, or 0 = all paths at once`)
+	scionTarget := fs.String("scion", "", `direct SCION target "ISD-AS,IP[:port]" (IPv6: "ISD-AS,[ip]:port"); skips DNS, URL host is the TLS name`)
+	maxASes := fs.Int("max-ases", 0, "limit on the number of distinct destination ASes (other than the own AS) whose paths are looked up; SCION endpoints in further ASes are not attempted (0 = library default, 4; negative = no limit)")
+	daemon := fs.String("daemon", "", "SCION daemon address (default $SCION_DAEMON_ADDRESS or 127.0.0.1:30255)")
+	repeat := fs.Int("repeat", 1, "run the fetch this many times in one process (fresh connection each run)")
+	stats := fs.Bool("stats", false, "print SCION path lookup and path racing statistics per run")
+	corruptPath := fs.Int("exp-corrupt-path", 0, "EXPERIMENT: corrupt the first hop field MAC of path N (1-based rank) of each SCION path set")
+	refreshPaths := fs.Bool("exp-refresh-paths", false, "EXPERIMENT: every path lookup asks the SCION daemon to fetch the paths anew instead of answering from its cache")
 	noSCION := fs.Bool("no-scion", false, "drop SCION candidates after resolve")
 	noIP := fs.Bool("no-ip", false, "drop IPv6/IPv4 candidates after resolve")
-	jsonOut := fs.Bool("json", false, "emit a JSON summary instead of the human race table")
+	jsonOut := fs.Bool("json", false, "emit a JSON summary (incl. SCION stats) instead of the human output; an array of runs with -repeat > 1")
 	insecure := fs.Bool("insecure", false, "skip TLS certificate verification on every leg")
 	ca := fs.String("ca", "", "PEM root CA file (default: /etc/hev3/ca.pem if it exists)")
 	attemptDelay := fs.Duration("attempt-delay", 0, "race attempt stagger (0 = library default, 250ms)")
-	resolutionDelay := fs.Duration("resolution-delay", 0, "SVCB resolution delay gate (0 = library default, 50ms)")
+	resolutionDelay := fs.Duration("resolution-delay", 0, "Resolution Delay (0 = library default, 25ms); a SCION-first client also waits for path lookups no longer than this after the first positive IP answer")
 	timeout := fs.Duration("timeout", 15*time.Second, "overall fetch timeout")
-	rrType := fs.String("rr-type", "both", `service RR type to query: "https", "svcb" or "both"`)
+	rrType := fs.String("rr-type", "https", `service RR type to query: "https" (the draft's single query for an https URL), "svcb", or "both" (HTTPS and SVCB in parallel, HTTPS answers preferred; not in the draft)`)
 	pfc := fs.Int("pfc", 1, "preferred address family count: candidates the preferred family races per interleave round")
-	minAttemptDelay := fs.Duration("min-attempt-delay", 0, "floor for the adaptive SCION stagger (0 = library default, 100ms; hard floor 10ms)")
+	minAttemptDelay := fs.Duration("min-attempt-delay", 0, "floor for the adaptive SCION stagger with -adaptive-delay (0 = library default, 100ms; hard floor 10ms)")
 	maxAttemptDelay := fs.Duration("max-attempt-delay", 0, "cap on the race stagger (0 = library default, 2s)")
-	noAdaptive := fs.Bool("no-adaptive-delay", false, "disable SCION path-latency adaptive staggering")
-	scionGrace := fs.Duration("scion-grace", 0, "hold IPv6/IPv4 attempts while SCION path lookup is in flight, up to this duration (0 = off; demo knob)")
+	adaptive := fs.Bool("adaptive-delay", false, "shorten the race stagger after a SCION endpoint to clamp(2 x declared latency of its first path + 60ms, -min-attempt-delay, -attempt-delay); not in the draft")
+	_ = fs.Bool("no-adaptive-delay", false, "no effect, accepted for existing scripts: the adaptive stagger is off unless -adaptive-delay is given")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -62,6 +79,42 @@ func run(args []string, stdout, stderr *os.File) int {
 	}
 	rawURL := fs.Arg(0)
 
+	// The library reads PathDelay 0 as "derive", negative as "all at once".
+	var pd time.Duration
+	if *pathDelay != "auto" {
+		d, err := time.ParseDuration(*pathDelay)
+		if err != nil || d < 0 {
+			fmt.Fprintln(stderr, `hev3: -path-delay must be "auto" or a duration >= 0`)
+			fs.Usage()
+			return 2
+		}
+		pd = d
+		if pd == 0 {
+			pd = -1
+		}
+	}
+	if *k < 1 || *repeat < 1 || *corruptPath < 0 {
+		fmt.Fprintln(stderr, "hev3: -k and -repeat must be >= 1; -exp-corrupt-path must be >= 0")
+		fs.Usage()
+		return 2
+	}
+	if *pathMode != hev3.PathModeAttempts && *pathMode != hev3.PathModeCopy {
+		fmt.Fprintln(stderr, `hev3: -path-mode must be "attempts" or "copy"`)
+		fs.Usage()
+		return 2
+	}
+	if *familyOrder != "scion-first" && *familyOrder != "ip-first" {
+		fmt.Fprintln(stderr, `hev3: -family-order must be "scion-first" or "ip-first"`)
+		fs.Usage()
+		return 2
+	}
+	if *pathAttemptDelay < 10*time.Millisecond {
+		fmt.Fprintln(stderr, "hev3: -path-attempt-delay below 10ms; using 10ms")
+		*pathAttemptDelay = 10 * time.Millisecond
+	}
+	if *k > 3 {
+		fmt.Fprintln(stderr, "hev3: a Path Attempt Count above 3 is NOT RECOMMENDED")
+	}
 	if *pfc < 1 {
 		fmt.Fprintln(stderr, "hev3: -pfc must be >= 1")
 		fs.Usage()
@@ -84,10 +137,12 @@ func run(args []string, stdout, stderr *os.File) int {
 		return 2
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
-	defer cancel()
-
-	res, err := hev3.Fetch(ctx, rawURL, hev3.Options{
+	var session *hev3.Session
+	if !*noSCION {
+		session = hev3.NewSession(*daemon)
+		defer session.Close()
+	}
+	opts := hev3.Options{
 		Resolver:             *resolver,
 		K:                    *k,
 		NoSCION:              *noSCION,
@@ -100,21 +155,68 @@ func run(args []string, stdout, stderr *os.File) int {
 		PreferredFamilyCount: *pfc,
 		MinAttemptDelay:      *minAttemptDelay,
 		MaxAttemptDelay:      *maxAttemptDelay,
-		NoAdaptiveDelay:      *noAdaptive,
-		SCIONGrace:           *scionGrace,
-	})
-	if err != nil {
-		fmt.Fprintln(stderr, err)
-		return 1
+		AdaptiveDelay:        *adaptive,
+		DaemonAddr:           *daemon,
+		IPFirst:              *familyOrder == "ip-first",
+		PathMode:             *pathMode,
+		PathAttemptDelay:     *pathAttemptDelay,
+		Linger:               *linger,
+		WaitLinger:           *stats || *jsonOut,
+		DeterministicPaths:   *fixedPaths,
+		MaxDestinationASes:   *maxASes,
+		PathDelay:            pd,
+		SCIONTarget:          *scionTarget,
+		Session:              session,
+		ExpCorruptPath:       *corruptPath,
+		ExpRefreshPaths:      *refreshPaths,
 	}
 
-	if *jsonOut {
-		printJSON(stdout, res)
-		return 0
+	code := 0
+	var runs []jsonResult
+	for i := 1; i <= *repeat; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+		start := time.Now()
+		res, err := hev3.Fetch(ctx, rawURL, opts)
+		total := time.Since(start)
+		if res != nil && res.Elapsed > 0 {
+			total = res.Elapsed // without the wait for cancelled path attempts
+		}
+		cancel()
+		if err != nil {
+			code = 1
+		}
+		if *jsonOut {
+			runs = append(runs, toJSON(i, res, err, total))
+			continue
+		}
+		if *repeat > 1 {
+			fmt.Fprintf(stdout, "=== run %d/%d (%.1fms) ===\n", i, *repeat, msec(total))
+		}
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			if *stats && res != nil {
+				printStats(stdout, res)
+			}
+			continue
+		}
+		printHuman(stdout, res, *repeat == 1)
+		if *stats {
+			printStats(stdout, res)
+		}
 	}
-	printHuman(stdout, res)
-	return 0
+	if *jsonOut {
+		enc := json.NewEncoder(stdout)
+		enc.SetIndent("", "  ")
+		if len(runs) == 1 {
+			_ = enc.Encode(runs[0])
+		} else {
+			_ = enc.Encode(runs)
+		}
+	}
+	return code
 }
+
+func msec(d time.Duration) float64 { return float64(d.Microseconds()) / 1000 }
 
 // --- human output ---------------------------------------------------------
 
@@ -173,21 +275,19 @@ func buildRaceRows(events []hev3.Event) []raceRow {
 	return suppressExpandedProtoRows(rows)
 }
 
-// suppressExpandedProtoRows drops a never-started row whose label is a
-// strict prefix of another row's label that did receive an attempt.
+// suppressExpandedProtoRows drops a never-started row whose label plus "#"
+// prefixes another row's label that did receive an attempt.
 //
-// Every SCION proto-candidate gets a "candidate" Timeline event under its
-// un-suffixed label ("scion:<IA>,<host>"), but ExpandSCION turns it into one
-// or more per-path children labelled "…#p1".."…#pK" before racing, so
-// "attempt" (and any outcome) only ever fires on the "#pN" children — the
-// parent label is left as a permanent, misleading "never-started" ghost row
-// sitting next to its own expanded children. A never-started row with no
-// such started child (e.g. a genuinely unreachable IPv6/IPv4 candidate)
-// keeps rendering as before — this only suppresses the redundant parent.
+// Every SCION endpoint gets a "candidate" Timeline event under its
+// un-suffixed label ("scion:<IA>,<host>"), but ExpandSCION turns it into
+// the candidate "…#paths" (its path set) before racing, so "attempt" (and
+// any outcome) only ever fires on the expanded child; the parent would be
+// a misleading "never-started" ghost row. A never-started row with no
+// started child (e.g. an unreachable IPv6/IPv4 candidate) is kept.
 func suppressExpandedProtoRows(rows []raceRow) []raceRow {
 	hasStartedChild := func(label string) bool {
 		for _, r := range rows {
-			if r.started && strings.HasPrefix(r.label, label+"#p") {
+			if r.started && strings.HasPrefix(r.label, label+"#") {
 				return true
 			}
 		}
@@ -206,8 +306,8 @@ func suppressExpandedProtoRows(rows []raceRow) []raceRow {
 // familyFromLabel infers a Candidate's family from its Label prefix — the
 // only place that survives into Timeline events. It mirrors the label
 // conventions resolver.go/dial_scion.go actually use ("scion:", "scitra:",
-// "v6:"/"v6hint:", "v4:"/"v4hint:", with per-path SCION expansion appending
-// "#pN" to a "scion:" prefix).
+// "v6:"/"v6hint:", "v4:"/"v4hint:", with SCION expansion appending "#paths"
+// to a "scion:" prefix).
 func familyFromLabel(label string) string {
 	switch {
 	case strings.HasPrefix(label, "scitra:"):
@@ -236,7 +336,7 @@ func familyName(f hev3.Family) string {
 	}
 }
 
-func printHuman(w *os.File, res *hev3.Result) {
+func printHuman(w *os.File, res *hev3.Result, body bool) {
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(tw, "LABEL\tFAMILY\tSTART(ms)\tOUTCOME\tWINNER")
 	for _, r := range buildRaceRows(res.Timeline) {
@@ -268,8 +368,103 @@ func printHuman(w *os.File, res *hev3.Result) {
 	fmt.Fprintln(w)
 	fmt.Fprintf(w, "winner: %s (%s, alpn=%s)\n", res.Winner.Label, familyName(res.Winner.Family), res.ALPN)
 	fmt.Fprintln(w, res.Status)
-	fmt.Fprintln(w)
-	printBodyPreview(w, res.Body)
+	if body {
+		fmt.Fprintln(w)
+		printBodyPreview(w, res.Body)
+	}
+}
+
+// printStats prints the SCION path lookups and racing attempts of one run.
+func printStats(w *os.File, res *hev3.Result) {
+	for _, l := range res.Lookups {
+		fmt.Fprintf(w, "lookup %s: %.1fms", l.Label, l.LookupMs)
+		if l.DaemonSetupMs > 0 {
+			fmt.Fprintf(w, " (+ daemon setup %.1fms)", l.DaemonSetupMs)
+		}
+		switch {
+		case l.OwnAS:
+			fmt.Fprint(w, " (own AS: no lookup)")
+		case l.Shared:
+			fmt.Fprint(w, " (shared with another endpoint in the AS)")
+		}
+		fmt.Fprintf(w, ", %d paths found, %d eligible", l.PathsFound, len(l.PathSet))
+		if l.Err != "" {
+			fmt.Fprintf(w, ", error: %s", l.Err)
+		}
+		fmt.Fprintln(w)
+		for _, x := range l.Excluded {
+			fmt.Fprintf(w, "  excluded: %s\n", x)
+		}
+	}
+	for _, a := range res.SCIONAttempts {
+		if a.Racer == nil {
+			fmt.Fprintf(w, "endpoint %s -> %s: handshake %.1fms (setup %.1fms), %d candidate paths, path attempt delay %.0fms", a.Label, a.Remote, a.HandshakeMs, a.SetupMs, len(a.Paths), a.PathAttemptDelayMs)
+			if a.Winner > 0 {
+				fmt.Fprintf(w, ", established over path %d", a.Winner)
+			}
+			if a.Err != "" {
+				fmt.Fprintf(w, ", error: %s", a.Err)
+			}
+			fmt.Fprintln(w)
+			for _, p := range a.Paths {
+				fmt.Fprintf(w, "  path %d %s: ", p.Rank, p.Interfaces)
+				if !p.Started {
+					fmt.Fprintf(w, "%s", p.Outcome)
+				} else {
+					fmt.Fprintf(w, "started at %.1fms from port %d, %s after %.1fms, sent %d pkts/%d B, recv %d pkts/%d B", p.StartMs, p.LocalPort, p.Outcome, p.HandshakeMs, p.SentPkts, p.SentBytes, p.RecvPkts, p.RecvBytes)
+				}
+				if p.Err != "" {
+					fmt.Fprintf(w, " (%s)", p.Err)
+				}
+				fmt.Fprintln(w)
+				for _, e := range p.SCMP {
+					fmt.Fprintf(w, "    scmp at %.1fms: %s", e.AtMs, e.Type)
+					if e.IA != "" {
+						fmt.Fprintf(w, " from %s ifid %d", e.IA, e.IfID)
+					}
+					fmt.Fprintln(w)
+				}
+			}
+			continue
+		}
+		r := *a.Racer
+		fmt.Fprintf(w, "attempt %s -> %s: handshake %.1fms (setup %.1fms)", a.Label, a.Remote, a.HandshakeMs, a.SetupMs)
+		if r.AllAtOnce {
+			fmt.Fprint(w, ", all paths at once")
+		}
+		if r.Selected > 0 {
+			fmt.Fprintf(w, ", selected path %d (%s) at %.1fms", r.Selected, r.SelectReason, r.SelectedAtMs)
+		}
+		if a.Err != "" {
+			fmt.Fprintf(w, ", error: %s", a.Err)
+		}
+		fmt.Fprintf(w, ", recv %d pkts/%d B", r.RecvPkts, r.RecvBytes)
+		if r.RecvForeign > 0 {
+			fmt.Fprintf(w, " (%d for another connection, ignored)", r.RecvForeign)
+		}
+		fmt.Fprintln(w)
+		for _, p := range r.Paths {
+			added := "not added"
+			if p.Added {
+				added = fmt.Sprintf("added at %.1fms (%s)", p.AddedAtMs, p.AddReason)
+			}
+			fmt.Fprintf(w, "  path %d %s: %s, %d pkts (%d copies), %d B", p.Rank, p.Interfaces, added, p.Pkts, p.Copies, p.Bytes)
+			if p.DelaySrc != "" {
+				fmt.Fprintf(w, ", path delay %.1fms (%s)", p.DelayMs, p.DelaySrc)
+			}
+			if p.Failed {
+				fmt.Fprintf(w, ", failed: %s", p.FailReason)
+			}
+			fmt.Fprintln(w)
+		}
+		for _, e := range r.SCMP {
+			fmt.Fprintf(w, "  scmp at %.1fms: %s from %s ifid %d, path %d", e.AtMs, e.Type, e.IA, e.IfID, e.Path)
+			if e.Ignored != "" {
+				fmt.Fprintf(w, " (ignored: %s)", e.Ignored)
+			}
+			fmt.Fprintln(w)
+		}
+	}
 }
 
 // printBodyPreview prints up to the first 20 lines of body (already capped
@@ -296,37 +491,48 @@ type jsonWinner struct {
 }
 
 type jsonEvent struct {
-	AtMs   int64  `json:"at_ms"`
-	Kind   string `json:"kind"`
-	Label  string `json:"label"`
-	Detail string `json:"detail,omitempty"`
+	AtMs   float64 `json:"at_ms"`
+	Kind   string  `json:"kind"`
+	Label  string  `json:"label"`
+	Detail string  `json:"detail,omitempty"`
 }
 
 type jsonResult struct {
-	Winner   jsonWinner  `json:"winner"`
-	ALPN     string      `json:"alpn"`
-	Status   string      `json:"status"`
-	Timeline []jsonEvent `json:"timeline"`
+	Run           int                      `json:"run"`
+	Error         string                   `json:"error,omitempty"`
+	Winner        jsonWinner               `json:"winner"` // empty on a lost race
+	ALPN          string                   `json:"alpn"`
+	Status        string                   `json:"status"`
+	TotalMs       float64                  `json:"total_ms"`             // Fetch call, incl. DNS and HTTP request
+	ConnectMs     float64                  `json:"connect_ms,omitempty"` // winner's "success" event
+	Lookups       []hev3.LookupStats       `json:"lookups,omitempty"`
+	SCIONAttempts []hev3.SCIONAttemptStats `json:"scion_attempts,omitempty"`
+	Timeline      []jsonEvent              `json:"timeline"`
 }
 
-func printJSON(w *os.File, res *hev3.Result) {
-	out := jsonResult{
-		Winner: jsonWinner{
-			Label:  res.Winner.Label,
-			Family: familyName(res.Winner.Family),
-		},
-		ALPN:   res.ALPN,
-		Status: res.Status,
+func toJSON(run int, res *hev3.Result, err error, total time.Duration) jsonResult {
+	out := jsonResult{Run: run, TotalMs: msec(total)}
+	if err != nil {
+		out.Error = err.Error()
 	}
+	if res == nil {
+		return out
+	}
+	if res.Winner.Label != "" {
+		out.Winner = jsonWinner{Label: res.Winner.Label, Family: familyName(res.Winner.Family)}
+	}
+	out.ALPN, out.Status = res.ALPN, res.Status
+	out.Lookups, out.SCIONAttempts = res.Lookups, res.SCIONAttempts
 	for _, ev := range res.Timeline {
+		if ev.Kind == "success" && ev.Label == res.Winner.Label && out.ConnectMs == 0 {
+			out.ConnectMs = msec(ev.At)
+		}
 		out.Timeline = append(out.Timeline, jsonEvent{
-			AtMs:   ev.At.Milliseconds(),
+			AtMs:   msec(ev.At),
 			Kind:   ev.Kind,
 			Label:  ev.Label,
 			Detail: ev.Detail,
 		})
 	}
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	_ = enc.Encode(out)
+	return out
 }

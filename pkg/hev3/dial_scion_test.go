@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net"
 	"path/filepath"
+	"reflect"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -17,11 +19,9 @@ import (
 
 const ms = time.Millisecond
 
-// fakePath is a minimal snet.Path carrying only the metadata ExpandSCION reads,
-// plus an optional name used by policy-ranking tests to identify a path (see fp).
+// fakePath is a minimal snet.Path carrying only the metadata ExpandSCION reads.
 type fakePath struct {
-	name string
-	md   *snet.PathMetadata
+	md *snet.PathMetadata
 }
 
 func (p fakePath) UnderlayNextHop() *net.UDPAddr { return nil }
@@ -36,29 +36,6 @@ func makePath(latencies []time.Duration, ifaceIDs []uint64) snet.Path {
 		ifs[i] = snet.PathInterface{ID: iface.ID(id), IA: addr.MustParseIA("1-150")}
 	}
 	return fakePath{md: &snet.PathMetadata{Interfaces: ifs, Latency: latencies}}
-}
-
-// namedPath builds a fakePath identified by name (retrieved via fp), carrying
-// latency and per-hop bandwidth metadata for scion-policy ranking/filter tests.
-// Interfaces are synthesized 1:1 with the latency entries (plus one), with IDs
-// derived deterministically from name so distinct paths get distinct
-// fingerprints; the exact hop topology is irrelevant to these tests.
-func namedPath(name string, latencies []time.Duration, bandwidths []uint64) snet.Path {
-	var h uint64 = 1
-	for _, b := range []byte(name) {
-		h = h*31 + uint64(b)
-	}
-	n := len(latencies) + 1
-	ifs := make([]snet.PathInterface, n)
-	for i := range ifs {
-		ifs[i] = snet.PathInterface{ID: iface.ID(h + uint64(i)), IA: addr.MustParseIA("1-150")}
-	}
-	return fakePath{name: name, md: &snet.PathMetadata{Interfaces: ifs, Latency: latencies, Bandwidth: bandwidths}}
-}
-
-// fp returns a fakePath's identifying name, for policy-ranking test assertions.
-func fp(p snet.Path) string {
-	return p.(fakePath).name
 }
 
 type fakeQuerier struct {
@@ -90,50 +67,148 @@ func protoCand() Candidate {
 	}
 }
 
+// One SCION endpoint becomes one candidate carrying all eligible paths
+// known, in the deterministic order of the selection: fewest AS hops first,
+// then known declared latency ascending, unknown latency after. The
+// candidate paths are selected from them when the endpoint is attempted.
 func TestExpandSCIONNativeRankingAndCap(t *testing.T) {
-	fast := makePath([]time.Duration{10 * ms}, []uint64{1, 2})             // 10ms, 2 hops
-	mid := makePath([]time.Duration{5 * ms, 5 * ms}, []uint64{3, 4, 5, 6}) // 10ms, 4 hops
-	slow := makePath([]time.Duration{30 * ms}, []uint64{7, 8})             // 30ms, 2 hops
-	unset := makePath([]time.Duration{-1}, []uint64{9, 10})                // unset ⇒ last
-	q := &fakeQuerier{paths: []snet.Path{slow, unset, fast, mid}}
+	fast := makePath([]time.Duration{10 * ms}, []uint64{1, 2})               // 2 AS hops, 10ms
+	three := makePath([]time.Duration{1 * ms, 1 * ms}, []uint64{3, 4, 5, 6}) // 3 AS hops, 2ms
+	slow := makePath([]time.Duration{30 * ms}, []uint64{7, 8})               // 2 AS hops, 30ms
+	unset := makePath([]time.Duration{-1}, []uint64{9, 10})                  // 2 AS hops, unknown
+	q := &fakeQuerier{paths: []snet.Path{three, slow, unset, fast}}
 	withQuerier(t, q, nil)
 
 	ipc := Candidate{Family: FamilyIPv6, Host: "2001:db8::1", Port: 443, Label: "v6:2001:db8::1"}
-	out := ExpandSCION(context.Background(), []Candidate{protoCand(), ipc}, DialerOptions{})
+	stats := &statsCollector{}
+	out := ExpandSCION(context.Background(), []Candidate{protoCand(), ipc}, DialerOptions{Stats: stats})
 
 	if q.gotDst != addr.MustParseIA("1-150") {
 		t.Fatalf("querier queried dst %s, want 1-150", q.gotDst)
 	}
-	// passthrough IP candidate first, then 3 ranked natives (unset dropped by K=3).
-	if len(out) != 4 {
-		t.Fatalf("got %d candidates, want 4: %+v", len(out), labels(out))
+	if len(out) != 2 {
+		t.Fatalf("got %d candidates, want 2 (passthrough + one SCION endpoint): %v", len(out), labels(out))
 	}
 	if out[0].Label != "v6:2001:db8::1" {
 		t.Fatalf("out[0] = %q, want passthrough IP candidate", out[0].Label)
 	}
-	natives := out[1:]
-	wantLabels := []string{
-		"scion:1-150,10.20.3.216#p1",
-		"scion:1-150,10.20.3.216#p2",
-		"scion:1-150,10.20.3.216#p3",
+	c := out[1]
+	if c.Label != "scion:1-150,10.20.3.216#paths" || c.Family != FamilySCION {
+		t.Fatalf("SCION candidate = %q family %v", c.Label, c.Family)
 	}
-	// Ranking: fast(10ms,2h) < mid(10ms,4h) < slow(30ms).
-	wantHops := []int{2, 4, 2}
-	wantLat := []time.Duration{10 * ms, 10 * ms, 30 * ms}
-	for i, c := range natives {
-		if c.Label != wantLabels[i] {
-			t.Errorf("native[%d] label = %q, want %q", i, c.Label, wantLabels[i])
+	if len(c.PathSet) != 4 {
+		t.Fatalf("candidate has %d paths, want all 4 eligible paths", len(c.PathSet))
+	}
+	if c.Path != &c.PathSet[0] {
+		t.Errorf("Path must point at PathSet[0]")
+	}
+	want := []snet.Path{fast, slow, unset} // three (3 AS hops) is ranked 4th
+	wantLat := []time.Duration{10 * ms, 30 * ms, 0}
+	for i, sp := range c.PathSet[:3] {
+		if sp.SNET.(snet.Path).Metadata() != want[i].Metadata() {
+			t.Errorf("PathSet[%d] = %s, want %s", i, sp.Interfaces, interfacesString(want[i].Metadata()))
 		}
-		if c.Family != FamilySCION || c.Path == nil {
-			t.Fatalf("native[%d] = %+v, want SCION with pinned path", i, c)
+		if sp.Hops != 2 || sp.Latency != wantLat[i] {
+			t.Errorf("PathSet[%d] hops=%d lat=%v, want 2/%v", i, sp.Hops, sp.Latency, wantLat[i])
 		}
-		if c.Path.Hops != wantHops[i] || c.Path.Latency != wantLat[i] {
-			t.Errorf("native[%d] hops=%d lat=%v, want hops=%d lat=%v",
-				i, c.Path.Hops, c.Path.Latency, wantHops[i], wantLat[i])
+	}
+	_, lookups := stats.snapshot()
+	if len(lookups) != 1 || lookups[0].PathsFound != 4 || len(lookups[0].PathSet) != 4 {
+		t.Errorf("lookup stats = %+v", lookups)
+	}
+}
+
+// localFakeQuerier is a fakeQuerier in a known own AS that records every
+// destination it is asked for.
+type localFakeQuerier struct {
+	fakeQuerier
+	local addr.IA
+	mu    sync.Mutex
+	dsts  []addr.IA
+}
+
+func (q *localFakeQuerier) Paths(ctx context.Context, dst addr.IA) ([]snet.Path, error) {
+	q.mu.Lock()
+	q.dsts = append(q.dsts, dst)
+	q.mu.Unlock()
+	return q.fakeQuerier.paths, nil
+}
+
+func (q *localFakeQuerier) LocalIA() addr.IA { return q.local }
+
+// Section 5.4 of draft-john-scion-svcb: paths are looked up for at most
+// MaxDestinationASes distinct destination ASes, the first ones in the order
+// the endpoints arrive. The own AS needs no lookup and does not count;
+// endpoints sharing an admitted AS share its lookup; an endpoint in a
+// further AS gets no lookup and is dropped with a note.
+func TestExpandSCIONDestinationASLimit(t *testing.T) {
+	q := &localFakeQuerier{fakeQuerier: fakeQuerier{paths: []snet.Path{makePath([]time.Duration{10 * ms}, []uint64{1, 2})}}, local: mustIA("1-153")}
+	withQuerier(t, q, nil)
+	mk := func(ia, host string) Candidate {
+		return Candidate{Family: FamilySCION, IA: ia, Host: host, Port: 443, ALPN: []string{"h3"}, Label: "scion:" + ia + "," + host}
+	}
+	in := []Candidate{mk("1-153", "10.0.0.3"), mk("1-150", "10.0.0.1"), mk("1-151", "10.0.0.2"), mk("1-150", "10.0.0.4"), mk("1-152", "10.0.0.5")}
+	tl := &Timeline{}
+	stats := &statsCollector{}
+	out := ExpandSCION(context.Background(), in, DialerOptions{Timeline: tl, Stats: stats, MaxDestinationASes: 2})
+	want := []string{"scion:1-153,10.0.0.3#paths", "scion:1-150,10.0.0.1#paths", "scion:1-151,10.0.0.2#paths", "scion:1-150,10.0.0.4#paths"}
+	if got := labels(out); !reflect.DeepEqual(got, want) {
+		t.Fatalf("candidates = %v, want %v", got, want)
+	}
+	if !hasFailNote(tl, "scion:1-152,10.0.0.5") {
+		t.Fatal("no Timeline note for the endpoint beyond the destination AS limit")
+	}
+	for _, d := range q.dsts {
+		if d == mustIA("1-152") || d == mustIA("1-153") {
+			t.Fatalf("paths looked up for %s: %v", d, q.dsts)
 		}
-		if _, ok := c.Path.SNET.(snet.Path); !ok {
-			t.Errorf("native[%d] SNET is %T, want snet.Path", i, c.Path.SNET)
+	}
+	_, lookups := stats.snapshot()
+	var limited int
+	for _, l := range lookups {
+		if l.Err == errDestinationASLimit.Error() {
+			limited++
 		}
+	}
+	if limited != 1 {
+		t.Fatalf("lookup stats %+v: want one entry for the AS beyond the limit", lookups)
+	}
+
+	// The ASes within the limit are the first registered, not the first
+	// whose lookup runs.
+	g := &lookupGroup{}
+	g.register(mustIA("1-152"))
+	g.register(mustIA("1-150"))
+	if g.admit(mustIA("1-150"), 0, 1) || !g.admit(mustIA("1-152"), 0, 1) {
+		t.Fatal("admit does not follow the registration order")
+	}
+	if !g.admit(mustIA("1-150"), 0, -1) {
+		t.Fatal("a negative limit must admit every AS")
+	}
+}
+
+// Two endpoints with the same SCION address from different records (labels
+// from scionLabel) stay two candidates, with one shared path lookup; with
+// scitra instead of a daemon they stay two candidates too.
+func TestExpandSCIONSameAddressTwoEndpoints(t *testing.T) {
+	q := &localFakeQuerier{fakeQuerier: fakeQuerier{paths: []snet.Path{makePath([]time.Duration{10 * ms}, []uint64{1, 2})}}, local: mustIA("1-153")}
+	withQuerier(t, q, nil)
+	a := protoCand()
+	b := protoCand()
+	b.Port, b.Priority, b.Label = 8443, 2, a.Label+"@8443/p2"
+	out := ExpandSCION(context.Background(), []Candidate{a, b}, DialerOptions{Lookups: &lookupGroup{}})
+	if len(out) != 2 || out[0].Label != a.Label+"#paths" || out[1].Label != b.Label+"#paths" || out[1].Port != 8443 {
+		t.Fatalf("candidates = %v, want both endpoints", labels(out))
+	}
+	if len(q.dsts) != 1 {
+		t.Fatalf("path lookups for %v, want one shared lookup", q.dsts)
+	}
+
+	withQuerier(t, nil, errors.New("no daemon"))
+	setRoute(t, true)
+	out = ExpandSCION(context.Background(), []Candidate{a, b}, DialerOptions{})
+	if len(out) != 2 || out[0].Label == out[1].Label || out[1].Label != "scitra:1-150,fc00:1000:9600::ffff:a14:3d8@8443/p2" {
+		t.Fatalf("scitra candidates = %v, want two distinct labels", labels(out))
 	}
 }
 
@@ -188,50 +263,6 @@ func TestExpandSCIONNoDaemonNoScitraDrops(t *testing.T) {
 	}
 	if !hasFailNote(tl, "scion:1-150,10.20.3.216") {
 		t.Fatal("expected a Timeline fail note when no daemon and no scitra route")
-	}
-}
-
-// scion-policy prefer items reorder path ranking: bw ranks by bottleneck
-// (minimum announced hop bandwidth) descending, before the default
-// latency ordering (draft-john-scion-svcb §4, F11).
-func TestRankPaths_PolicyBandwidthFirst(t *testing.T) {
-	fast := namedPath("fast", []time.Duration{10 * ms}, []uint64{10_000})
-	fat := namedPath("fat", []time.Duration{40 * ms}, []uint64{100_000})
-	paths := []snet.Path{fast, fat}
-
-	rankPaths(paths, nil)
-	if fp(paths[0]) != "fast" {
-		t.Errorf("nil policy: want latency-first ranking, got %v first", fp(paths[0]))
-	}
-
-	paths = []snet.Path{fast, fat}
-	rankPaths(paths, &PathPolicy{Prefer: []PolicyMetric{MetricBandwidth}})
-	if fp(paths[0]) != "fat" {
-		t.Errorf("bw policy: want bottleneck-bandwidth-first ranking, got %v first", fp(paths[0]))
-	}
-}
-
-// Threshold items filter the path set; when EVERY path violates, the
-// thresholds are ignored entirely (draft MUST fail-open).
-func TestFilterByPolicy_ThresholdsAndFailOpen(t *testing.T) {
-	near := namedPath("near", []time.Duration{10 * ms}, []uint64{10_000})
-	far := namedPath("far", []time.Duration{200 * ms}, []uint64{10_000})
-
-	kept, failedOpen := filterByPolicy([]snet.Path{near, far}, &PathPolicy{MaxLatency: 50 * ms})
-	if failedOpen || len(kept) != 1 || fp(kept[0]) != "near" {
-		t.Errorf("filter = %d paths (failedOpen=%v), want just 'near'", len(kept), failedOpen)
-	}
-
-	kept, failedOpen = filterByPolicy([]snet.Path{far}, &PathPolicy{MaxLatency: 50 * ms})
-	if !failedOpen || len(kept) != 1 {
-		t.Errorf("all-violating set must fail open with every path kept, got %d (failedOpen=%v)", len(kept), failedOpen)
-	}
-
-	// A path with unknown latency can not violate a latency threshold.
-	unknown := namedPath("unknown", []time.Duration{-1}, []uint64{10_000})
-	kept, failedOpen = filterByPolicy([]snet.Path{unknown, far}, &PathPolicy{MaxLatency: 50 * ms})
-	if failedOpen || len(kept) != 1 || fp(kept[0]) != "unknown" {
-		t.Errorf("unknown-latency path must survive a maxlat filter, got %v (failedOpen=%v)", len(kept), failedOpen)
 	}
 }
 
@@ -340,3 +371,7 @@ func hasFailNote(tl *Timeline, label string) bool {
 	}
 	return false
 }
+
+type addrIA = addr.IA
+
+func mustIA(s string) addr.IA { return addr.MustParseIA(s) }

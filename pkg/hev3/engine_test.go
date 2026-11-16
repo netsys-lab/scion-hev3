@@ -3,6 +3,8 @@ package hev3
 import (
 	"context"
 	"errors"
+	"fmt"
+	"reflect"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -86,6 +88,34 @@ func TestEngine_AdaptiveStaggerTightensAfterSCION(t *testing.T) {
 	}
 	if gap < 20*time.Millisecond-5*time.Millisecond {
 		t.Fatalf("v4 started %v after SCION; below the 20ms min floor", gap)
+	}
+	cancel()
+	waitClosed(t, done, time.Second, "engine return")
+}
+
+// The adaptive stagger is not in the draft: without RaceOptions.AdaptiveDelay
+// the next attempt after a SCION endpoint with a known path latency waits
+// the full Connection Attempt Delay.
+func TestRace_AdaptiveStaggerOffByDefault(t *testing.T) {
+	sc := Candidate{Family: FamilySCION, Host: "10.0.0.1", IA: "1-150",
+		Label: "scion:1-150,10.0.0.1#p1",
+		Path:  &SCIONPath{Latency: 5 * time.Millisecond, Hops: 2}}
+	ip := cand("v4")
+	ctls := map[string]*ctl{sc.Label: newCtl(), "v4": newCtl()}
+	ctls[sc.Label].block = true
+	ctls["v4"].block = true
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		Race(ctx, []Candidate{sc, ip}, fakeDialer(ctls), RaceOptions{AttemptDelay: 200 * time.Millisecond})
+		close(done)
+	}()
+	waitClosed(t, ctls[sc.Label].started, time.Second, "start of scion")
+	waitClosed(t, ctls["v4"].started, time.Second, "start of v4")
+	if gap := ctls["v4"].startedAt.Sub(ctls[sc.Label].startedAt); gap < 190*time.Millisecond {
+		t.Fatalf("v4 started %v after SCION; want the full 200ms Connection Attempt Delay", gap)
 	}
 	cancel()
 	waitClosed(t, done, time.Second, "engine return")
@@ -321,6 +351,26 @@ func TestEngine_FilterSparesExpandedScitraChild(t *testing.T) {
 	}
 }
 
+// register sees the proto candidates in arrival order, before their
+// expansions run, so the destination AS limit picks the first ASes of the
+// list rather than the first lookups to run.
+func TestEngine_RegisterInArrivalOrder(t *testing.T) {
+	p1 := Candidate{Family: FamilySCION, IA: "1-152", Host: "10.0.0.1", Label: "scion:1-152,10.0.0.1"}
+	p2 := Candidate{Family: FamilySCION, IA: "1-150", Host: "10.0.0.2", Label: "scion:1-150,10.0.0.2"}
+	var got []string
+	_, _ = runEngine(context.Background(), engineConfig{
+		dial:     fakeDialer(nil),
+		initial:  []Candidate{p1, p2},
+		isProto:  func(c Candidate) bool { return c.Family == FamilySCION && c.Path == nil },
+		register: func(c Candidate) { got = append(got, c.Label) },
+		expand:   func(ctx context.Context, c Candidate) []Candidate { return nil },
+		delay:    20 * time.Millisecond,
+	})
+	if !reflect.DeepEqual(got, []string{p1.Label, p2.Label}) {
+		t.Fatalf("registered %v, want %v", got, []string{p1.Label, p2.Label})
+	}
+}
+
 // Memoization: a proto label re-sent by every subsequent update expands
 // exactly once (expandCached's replacement), and an expansion yielding
 // nothing leaves the engine waiting rather than failing while updates are
@@ -433,10 +483,10 @@ func TestEngine_MaxDelayCannotDefeatFloor(t *testing.T) {
 
 // SCION grace: with grace enabled and a proto expanding, the IP leg is
 // held until expansion completes; the SCION child then launches first.
-func TestEngine_SCIONGraceHoldsIPUntilExpansion(t *testing.T) {
+func TestEngine_ExpansionDelayHoldsIPUntilExpansion(t *testing.T) {
 	proto := Candidate{Family: FamilySCION, IA: "1-150", Host: "10.0.0.1", Label: "scion:1-150,10.0.0.1"}
 	child := proto
-	child.Label = proto.Label + "#p1"
+	child.Label = proto.Label + "#paths"
 	child.Path = &SCIONPath{Latency: 2 * time.Millisecond}
 	ip := cand("v4")
 	ctls := map[string]*ctl{child.Label: newCtl(), "v4": newCtl()}
@@ -455,9 +505,9 @@ func TestEngine_SCIONGraceHoldsIPUntilExpansion(t *testing.T) {
 				time.Sleep(80 * time.Millisecond)
 				return []Candidate{child}
 			},
-			sortFn:     func(cs []Candidate) []Candidate { return Sort(cs, hasNativeSCIONPath(cs), 1) },
+			sortFn:     func(cs []Candidate) []Candidate { return Sort(cs, hasSCION(cs), 1) },
 			delay:      30 * time.Millisecond,
-			scionGrace: 500 * time.Millisecond,
+			lookupWait: 500 * time.Millisecond,
 		})
 		close(done)
 	}()
@@ -477,7 +527,7 @@ func TestEngine_SCIONGraceHoldsIPUntilExpansion(t *testing.T) {
 }
 
 // Grace expiry releases the hold even while expansion is still running.
-func TestEngine_SCIONGraceExpiryReleasesHold(t *testing.T) {
+func TestEngine_ExpansionDelayExpiryReleasesHold(t *testing.T) {
 	proto := Candidate{Family: FamilySCION, IA: "1-150", Host: "10.0.0.1", Label: "scion:1-150,10.0.0.1"}
 	ip := cand("v4")
 	ctls := map[string]*ctl{"v4": newCtl()}
@@ -498,7 +548,7 @@ func TestEngine_SCIONGraceExpiryReleasesHold(t *testing.T) {
 				return nil
 			},
 			delay:      20 * time.Millisecond,
-			scionGrace: 60 * time.Millisecond,
+			lookupWait: 60 * time.Millisecond,
 		})
 		close(done)
 	}()
@@ -517,7 +567,7 @@ func TestEngine_SCIONGraceExpiryReleasesHold(t *testing.T) {
 
 // A dropped expansion (no children) releases the hold immediately — long
 // before the grace would expire.
-func TestEngine_SCIONGraceEmptyExpansionReleasesImmediately(t *testing.T) {
+func TestEngine_ExpansionDelayEmptyExpansionReleasesImmediately(t *testing.T) {
 	proto := Candidate{Family: FamilySCION, IA: "1-150", Host: "10.0.0.1", Label: "scion:1-150,10.0.0.1"}
 	ip := cand("v4")
 	ctls := map[string]*ctl{"v4": newCtl()}
@@ -538,7 +588,7 @@ func TestEngine_SCIONGraceEmptyExpansionReleasesImmediately(t *testing.T) {
 				return nil // daemonless drop
 			},
 			delay:      20 * time.Millisecond,
-			scionGrace: 2 * time.Second,
+			lookupWait: 2 * time.Second,
 		})
 		close(done)
 	}()
@@ -552,7 +602,7 @@ func TestEngine_SCIONGraceEmptyExpansionReleasesImmediately(t *testing.T) {
 }
 
 // Grace with no protos at all is inert: the IP leg launches immediately.
-func TestEngine_SCIONGraceInertWithoutProtos(t *testing.T) {
+func TestEngine_ExpansionDelayInertWithoutProtos(t *testing.T) {
 	ip := cand("v4")
 	ctls := map[string]*ctl{"v4": newCtl()}
 	ctls["v4"].block = true
@@ -565,7 +615,7 @@ func TestEngine_SCIONGraceInertWithoutProtos(t *testing.T) {
 		runEngine(ctx, engineConfig{
 			dial:       fakeDialer(ctls),
 			initial:    []Candidate{ip},
-			scionGrace: time.Second,
+			lookupWait: time.Second,
 			delay:      20 * time.Millisecond,
 		})
 		close(done)
@@ -583,7 +633,7 @@ func TestEngine_SCIONGraceInertWithoutProtos(t *testing.T) {
 // and no stagger timer is armed; closing updates flips updatesOpen false but
 // cannot trip the terminal condition (pending is non-empty), and the grace
 // timer remains the backstop that fires to release the hold.
-func TestEngine_SCIONGraceUpdatesCloseDuringHold(t *testing.T) {
+func TestEngine_ExpansionDelayUpdatesCloseDuringHold(t *testing.T) {
 	proto := Candidate{Family: FamilySCION, IA: "1-150", Host: "10.0.0.1", Label: "scion:1-150,10.0.0.1"}
 	ip := cand("v4")
 	ctls := map[string]*ctl{"v4": newCtl()}
@@ -605,7 +655,7 @@ func TestEngine_SCIONGraceUpdatesCloseDuringHold(t *testing.T) {
 				return nil
 			},
 			delay:      20 * time.Millisecond,
-			scionGrace: 60 * time.Millisecond,
+			lookupWait: 60 * time.Millisecond,
 		})
 		close(done)
 	}()
@@ -646,4 +696,153 @@ func TestEngine_AdaptiveNeverExceedsBase(t *testing.T) {
 	}
 	cancel()
 	waitClosed(t, done, time.Second, "engine return")
+}
+
+// When an attempt to a SCION endpoint fails, the next attempt starts
+// without waiting for the Connection Attempt Delay, but not within 10 ms of
+// the start of the failed one.
+func TestEngine_SCIONFailureAdvancesAfterFloor(t *testing.T) {
+	sc := Candidate{Family: FamilySCION, Host: "10.0.0.1", IA: "1-150",
+		Label: "scion:1-150,10.0.0.1#paths", Path: &SCIONPath{Hops: 2}}
+	ip := cand("v4")
+	ctls := map[string]*ctl{sc.Label: newCtl(), "v4": newCtl()}
+	ctls[sc.Label].err = errAllPathsFailed // fails at once
+	ctls["v4"].block = true
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		runEngine(ctx, engineConfig{
+			dial:     fakeDialer(ctls),
+			initial:  []Candidate{sc, ip},
+			delay:    time.Second,
+			minDelay: 80 * time.Millisecond,
+		})
+		close(done)
+	}()
+	waitClosed(t, ctls[sc.Label].started, time.Second, "start of scion")
+	waitClosed(t, ctls["v4"].started, time.Second, "start of v4")
+	gap := ctls["v4"].startedAt.Sub(ctls[sc.Label].startedAt)
+	if gap < 9*time.Millisecond {
+		t.Fatalf("v4 started %v after the failed SCION attempt, want >= 10ms", gap)
+	}
+	if gap > 500*time.Millisecond {
+		t.Fatalf("v4 started %v after the failed SCION attempt: waited for the 1s attempt delay", gap)
+	}
+	cancel()
+	waitClosed(t, done, time.Second, "engine return")
+}
+
+// A SCION endpoint with no eligible path at attempt time is skipped: the
+// next endpoint is attempted at once, not 10 ms later.
+func TestEngine_NoEligiblePathAdvancesAtOnce(t *testing.T) {
+	sc := Candidate{Family: FamilySCION, Host: "10.0.0.1", IA: "1-150",
+		Label: "scion:1-150,10.0.0.1#paths", Path: &SCIONPath{Hops: 2}}
+	ctls := map[string]*ctl{sc.Label: newCtl(), "v4": newCtl()}
+	ctls[sc.Label].err = fmt.Errorf("dial: %w", errNoEligiblePath)
+	ctls["v4"].block = true
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		runEngine(ctx, engineConfig{dial: fakeDialer(ctls), initial: []Candidate{sc, cand("v4")}, delay: time.Second})
+		close(done)
+	}()
+	waitClosed(t, ctls["v4"].started, time.Second, "start of v4")
+	if gap := ctls["v4"].startedAt.Sub(ctls[sc.Label].startedAt); gap > 8*time.Millisecond {
+		t.Fatalf("v4 started %v after the skipped SCION endpoint, want at once", gap)
+	}
+	cancel()
+	waitClosed(t, done, time.Second, "engine return")
+}
+
+// No attempt starts within 10 ms of the start of an attempt over a
+// candidate path of a SCION endpoint: the endpoint's second path attempt
+// starts 30 ms in, the endpoint fails 35 ms in, the next attempt starts
+// 40 ms in.
+func TestEngine_FloorCountsPathAttempts(t *testing.T) {
+	sc := Candidate{Family: FamilySCION, Host: "10.0.0.1", IA: "1-150",
+		Label: "scion:1-150,10.0.0.1#paths", Path: &SCIONPath{Hops: 2}}
+	v4 := newCtl()
+	v4.block = true
+	var scStart, pathStart time.Time
+	scStarted := make(chan struct{})
+	dial := func(ctx context.Context, c Candidate) (*Established, error) {
+		if c.Label != sc.Label {
+			return fakeDialer(map[string]*ctl{"v4": v4})(ctx, c)
+		}
+		scStart = time.Now()
+		time.Sleep(30 * time.Millisecond)
+		pathStart = time.Now()
+		pathStartHookFrom(ctx)(pathStart)
+		time.Sleep(5 * time.Millisecond)
+		close(scStarted)
+		return nil, errAllAttemptsFailed
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		runEngine(ctx, engineConfig{dial: dial, initial: []Candidate{sc, cand("v4")}, delay: time.Second})
+		close(done)
+	}()
+	waitClosed(t, v4.started, time.Second, "start of v4")
+	<-scStarted
+	if gap := v4.startedAt.Sub(pathStart); gap < 9500*time.Microsecond || gap > 60*time.Millisecond {
+		t.Fatalf("v4 started %v after the last path attempt (%v after the endpoint), want ~10ms", gap, v4.startedAt.Sub(scStart))
+	}
+	cancel()
+	waitClosed(t, done, time.Second, "engine return")
+}
+
+// A path lookup is waited for no longer than the Resolution Delay after
+// the first positive IP answer: if that passed before the IP endpoint was
+// due, the IP attempt starts at once.
+func TestEngine_LookupWaitCountsFromFirstIPAnswer(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		answered time.Duration // how long ago the first IP answer arrived
+		min, max time.Duration
+	}{
+		{"just answered", 0, 50 * time.Millisecond, 150 * time.Millisecond},
+		{"answered 40ms ago", 40 * time.Millisecond, 10 * time.Millisecond, 45 * time.Millisecond},
+		{"answered long ago", time.Second, 0, 15 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			proto := Candidate{Family: FamilySCION, IA: "1-150", Host: "10.0.0.1", Label: "scion:1-150,10.0.0.1"}
+			ctls := map[string]*ctl{"v4": newCtl()}
+			ctls["v4"].block = true
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			start := time.Now()
+			at := start.Add(-tc.answered)
+			done := make(chan struct{})
+			go func() {
+				runEngine(ctx, engineConfig{
+					dial: fakeDialer(ctls), initial: []Candidate{proto, cand("v4")},
+					updates: make(chan []Candidate),
+					isProto: func(c Candidate) bool { return c.Family == FamilySCION && c.Path == nil },
+					expand: func(ctx context.Context, c Candidate) []Candidate {
+						select {
+						case <-time.After(time.Second):
+						case <-ctx.Done():
+						}
+						return nil
+					},
+					sortFn:     func(cs []Candidate) []Candidate { return Sort(cs, true, 1) },
+					delay:      time.Second,
+					lookupWait: 60 * time.Millisecond,
+					ipAnswerAt: func() time.Time { return at },
+				})
+				close(done)
+			}()
+			waitClosed(t, ctls["v4"].started, time.Second, "start of v4")
+			if w := ctls["v4"].startedAt.Sub(start); w < tc.min || w > tc.max {
+				t.Fatalf("v4 started after %v, want within [%v, %v]", w, tc.min, tc.max)
+			}
+			cancel()
+			waitClosed(t, done, time.Second, "engine return")
+		})
+	}
 }

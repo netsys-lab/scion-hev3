@@ -2,12 +2,13 @@ package hev3
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/netip"
-	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	daemon_types "github.com/scionproto/scion/pkg/daemon/types"
 	"github.com/scionproto/scion/pkg/snet"
 	"github.com/scionproto/scion/pkg/snet/addrutil"
+	snetpath "github.com/scionproto/scion/pkg/snet/path"
 )
 
 // pathQuerier lists SCION paths to a destination IA. It is the seam tests use
@@ -30,10 +32,29 @@ type pathQuerier interface {
 type daemonQuerier struct {
 	conn    daemon.Connector
 	localIA addr.IA
+	local   *lazyIP // nil: local IP unknown
+	refresh bool    // experiments: ask the daemon to fetch the paths anew
+}
+
+type lazyIP struct {
+	once sync.Once
+	ip   net.IP
+	err  error
+}
+
+// LocalIP returns the default local underlay IP (resolved once).
+func (q daemonQuerier) LocalIP(ctx context.Context) (net.IP, error) {
+	if q.local == nil {
+		return nil, errors.New("hev3: local IP unknown")
+	}
+	q.local.once.Do(func() {
+		q.local.ip, q.local.err = addrutil.DefaultLocalIP(ctx, daemon.TopoQuerier{Connector: q.conn})
+	})
+	return q.local.ip, q.local.err
 }
 
 func (q daemonQuerier) Paths(ctx context.Context, dst addr.IA) ([]snet.Path, error) {
-	return q.conn.Paths(ctx, dst, q.localIA, daemon_types.PathReqFlags{})
+	return q.conn.Paths(ctx, dst, q.localIA, daemon_types.PathReqFlags{Refresh: q.refresh})
 }
 
 // resolveQuerier connects to sciond and returns a daemonQuerier. It is a var so
@@ -48,7 +69,7 @@ var resolveQuerier = func(ctx context.Context, o DialerOptions) (pathQuerier, er
 		_ = conn.Close()
 		return nil, fmt.Errorf("hev3: querying local IA: %w", err)
 	}
-	return daemonQuerier{conn: conn, localIA: localIA}, nil
+	return daemonQuerier{conn: conn, localIA: localIA, local: &lazyIP{}, refresh: o.ExpRefreshPaths}, nil
 }
 
 // scionContextConnectTimeout bounds the detached context each scionContext
@@ -210,19 +231,128 @@ func (s *scionContext) Close() error {
 	return nil
 }
 
-// ExpandSCION turns proto-SCION candidates (FamilySCION, no pinned Path) into
-// dialable candidates. With a reachable daemon each proto-candidate becomes up
-// to K native per-path candidates ranked by advertised latency then hop count,
-// labelled "…#p1".."…#pK". With no daemon but an fc00 scitra route present,
-// each becomes one ViaScitra candidate dialed as its mapped IPv6 address; with
-// neither, the SCION candidates are dropped (recorded as Timeline "fail"
-// notes). Non-SCION and already-expanded candidates pass through unchanged.
-func ExpandSCION(ctx context.Context, cands []Candidate, o DialerOptions) []Candidate {
-	k := o.K
-	if k <= 0 {
-		k = defaultK
-	}
+// defaultMaxDestinationASes is the default limit on the number of distinct
+// destination ASes for which one connection establishment looks up paths
+// (draft-john-scion-svcb, Section 5.4, which sets no number).
+const defaultMaxDestinationASes = 4
 
+// errDestinationASLimit drops a SCION endpoint whose AS is beyond the limit
+// on destination ASes.
+var errDestinationASLimit = errors.New("destination AS beyond the limit on path lookups")
+
+// lookupGroup shares one path lookup per destination ISD-AS among the SCION
+// endpoints of one connection establishment, and limits the number of
+// distinct destination ASes that get a lookup.
+type lookupGroup struct {
+	mu sync.Mutex
+	m  map[addr.IA]*lookupCall
+	// order lists the destination ASes in the order their first endpoint
+	// was created; the first ones, up to the limit, get a lookup.
+	order []addr.IA
+}
+
+// register records that an endpoint in ia was created. Registering in the
+// order the endpoints arrive makes the choice of the ASes within the limit
+// independent of the order in which the lookups run.
+func (g *lookupGroup) register(ia addr.IA) {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.registerLocked(ia)
+}
+
+func (g *lookupGroup) registerLocked(ia addr.IA) {
+	for _, x := range g.order {
+		if x == ia {
+			return
+		}
+	}
+	g.order = append(g.order, ia)
+}
+
+// admit reports whether paths to ia may be looked up: ia is among the first
+// limit destination ASes registered, not counting local, the client's own
+// AS, which needs no lookup. limit 0 means defaultMaxDestinationASes, a
+// negative limit means no limit.
+func (g *lookupGroup) admit(ia, local addr.IA, limit int) bool {
+	if g == nil || limit < 0 {
+		return true
+	}
+	if limit == 0 {
+		limit = defaultMaxDestinationASes
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.registerLocked(ia)
+	n := 0
+	for _, x := range g.order {
+		if x == local {
+			continue
+		}
+		if x == ia {
+			return n < limit
+		}
+		n++
+	}
+	return false
+}
+
+type lookupCall struct {
+	done  chan struct{}
+	paths []snet.Path
+	err   error
+	dur   time.Duration
+}
+
+// do returns the result of the lookup for ia, running fn if no lookup for
+// ia was started yet. shared reports that another caller's lookup was used.
+func (g *lookupGroup) do(ctx context.Context, ia addr.IA, fn func() ([]snet.Path, error)) (paths []snet.Path, err error, dur time.Duration, shared bool) {
+	if g == nil {
+		start := time.Now()
+		paths, err = fn()
+		return paths, err, time.Since(start), false
+	}
+	g.mu.Lock()
+	if g.m == nil {
+		g.m = map[addr.IA]*lookupCall{}
+	}
+	c, ok := g.m[ia]
+	if !ok {
+		c = &lookupCall{done: make(chan struct{})}
+		g.m[ia] = c
+	}
+	g.mu.Unlock()
+	if !ok {
+		start := time.Now()
+		c.paths, c.err = fn()
+		c.dur = time.Since(start)
+		close(c.done)
+		return c.paths, c.err, c.dur, false
+	}
+	select {
+	case <-c.done:
+		return c.paths, c.err, c.dur, true
+	case <-ctx.Done():
+		return nil, ctx.Err(), 0, true
+	}
+}
+
+// ExpandSCION performs the path lookups of unexpanded SCION endpoints
+// (FamilySCION, no path set) and turns them into dialable candidates. With
+// a reachable daemon, an endpoint whose lookup returns at least one
+// eligible path becomes ONE candidate carrying all eligible paths known
+// (PathSet), labelled "<label>#paths"; the candidate paths are selected
+// from them when the endpoint is attempted (dialSCION). An endpoint in the
+// client's own AS needs no lookup and uses the empty path. A lookup that
+// fails, takes longer than pathLookupLimit or returns no eligible path
+// drops the endpoint. With no daemon but an fc00 scitra route present,
+// each endpoint becomes one ViaScitra candidate dialed as its mapped IPv6
+// address; with neither, the SCION candidates are dropped (recorded as
+// Timeline "fail" notes). Non-SCION and already-expanded candidates pass
+// through unchanged.
+func ExpandSCION(ctx context.Context, cands []Candidate, o DialerOptions) []Candidate {
 	var passthrough, proto []Candidate
 	for _, c := range cands {
 		if c.Family == FamilySCION && c.Path == nil && !c.ViaScitra {
@@ -234,66 +364,166 @@ func ExpandSCION(ctx context.Context, cands []Candidate, o DialerOptions) []Cand
 	if len(proto) == 0 {
 		return passthrough
 	}
+	if o.Lookups == nil {
+		o.Lookups = &lookupGroup{}
+	}
+	for _, c := range proto {
+		if ia, err := addr.ParseIA(c.IA); err == nil {
+			o.Lookups.register(ia)
+		}
+	}
+	// The client gives up on a lookup pathLookupLimit after it started.
+	ctx, cancel := context.WithTimeout(ctx, pathLookupLimit)
+	defer cancel()
 
 	out := passthrough
 	var q pathQuerier
 	var err error
+	setupStart := time.Now()
 	if o.SCION != nil {
-		q, err = o.SCION.querier(ctx, o)
+		// The shared daemon connect runs on a detached context with a
+		// longer timeout (detachedConnectContext); this endpoint still
+		// gives up on it at the lookup limit.
+		type querierResult struct {
+			q   pathQuerier
+			err error
+		}
+		ch := make(chan querierResult, 1)
+		go func() {
+			q, err := o.SCION.querier(ctx, o)
+			ch <- querierResult{q, err}
+		}()
+		select {
+		case r := <-ch:
+			q, err = r.q, r.err
+		case <-ctx.Done():
+			err = fmt.Errorf("hev3: connecting to daemon: %w", ctx.Err())
+		}
 	} else {
 		q, err = resolveQuerier(ctx, o)
 	}
+	setup := time.Since(setupStart)
 	if err != nil {
+		for _, c := range proto {
+			o.Stats.addLookup(LookupStats{Label: c.Label, DaemonSetupMs: msec(setup), Err: err.Error()})
+		}
 		// Daemon absent: fall back to scitra when the route exists, else drop.
 		return append(out, fallbackNoDaemon(proto, o)...)
 	}
-	for _, c := range proto {
-		out = append(out, expandOne(ctx, q, c, k, o)...)
+	for i, c := range proto {
+		ls := LookupStats{Label: c.Label}
+		if i == 0 {
+			ls.DaemonSetupMs = msec(setup)
+		}
+		if nc, ok := expandOne(ctx, q, c, o, &ls); ok {
+			out = append(out, nc)
+		}
+		o.Stats.addLookup(ls)
 	}
 	return out
 }
 
-// expandOne queries and ranks paths for one proto-candidate and emits up to k
-// native per-path candidates. A parse failure or a daemon that reports no paths
-// drops the candidate with a Timeline note (the daemon is present, so scitra —
-// the no-daemon fallback — does not apply here).
-func expandOne(ctx context.Context, q pathQuerier, c Candidate, k int, o DialerOptions) []Candidate {
+// localIPQuerier is optionally implemented by a pathQuerier that knows the
+// local underlay IP (used for the exact SCION header size in the MTU check).
+type localIPQuerier interface {
+	LocalIP(ctx context.Context) (net.IP, error)
+}
+
+// localIAQuerier is optionally implemented by a pathQuerier that knows the
+// client's own ISD-AS.
+type localIAQuerier interface {
+	LocalIA() addr.IA
+}
+
+// LocalIA returns the client's ISD-AS.
+func (q daemonQuerier) LocalIA() addr.IA { return q.localIA }
+
+// expandOne performs the path lookup for one SCION endpoint. A parse
+// failure, a failed lookup, or no eligible path drops the endpoint with a
+// Timeline note (the daemon is present, so scitra - the no-daemon fallback
+// - does not apply here).
+func expandOne(ctx context.Context, q pathQuerier, c Candidate, o DialerOptions, ls *LookupStats) (Candidate, bool) {
 	dst, err := addr.ParseIA(c.IA)
 	if err != nil {
 		note(o, c, fmt.Sprintf("bad IA %q: %v", c.IA, err))
-		return nil
+		ls.Err = err.Error()
+		return Candidate{}, false
 	}
-	paths, err := q.Paths(ctx, dst)
+	host, err := netip.ParseAddr(c.Host)
+	if err != nil {
+		note(o, c, fmt.Sprintf("bad host %q: %v", c.Host, err))
+		ls.Err = err.Error()
+		return Candidate{}, false
+	}
+	nc := c
+	nc.Label = c.Label + "#paths"
+	var local addr.IA
+	if lq, ok := q.(localIAQuerier); ok {
+		local = lq.LocalIA()
+	}
+	if local != dst && !o.Lookups.admit(dst, local, o.MaxDestinationASes) {
+		// Section 5.4 of draft-john-scion-svcb: no lookup, not attempted.
+		note(o, c, errDestinationASLimit.Error())
+		ls.Err = errDestinationASLimit.Error()
+		return Candidate{}, false
+	}
+	if local == dst {
+		// An endpoint in the client's own AS: no lookup, the empty path.
+		ls.OwnAS = true
+		p := snetpath.Path{Src: dst, Dst: dst, DataplanePath: snetpath.Empty{}}
+		nc.PathSet = []SCIONPath{{Hops: 1, Interfaces: interfacesString(nil), SNET: snet.Path(p)}}
+		nc.Path = &nc.PathSet[0]
+		ls.PathSet = []string{nc.PathSet[0].Interfaces}
+		return nc, true
+	}
+	srcLen := 16 // conservative when the local address is unknown
+	var localDone chan struct{}
+	if lq, ok := q.(localIPQuerier); ok {
+		localDone = make(chan struct{})
+		go func() {
+			defer close(localDone)
+			if ip, err := lq.LocalIP(ctx); err == nil {
+				if a, ok := netip.AddrFromSlice(ip); ok {
+					srcLen = hostLen(a)
+				}
+			}
+		}()
+	}
+	paths, err, dur, shared := o.Lookups.do(ctx, dst, func() ([]snet.Path, error) { return q.Paths(ctx, dst) })
+	ls.LookupMs, ls.Shared = msec(dur), shared
+	if localDone != nil {
+		<-localDone
+	}
+	ls.PathsFound = len(paths)
 	if err != nil {
 		note(o, c, fmt.Sprintf("path lookup failed: %v", err))
-		return nil
+		ls.Err = err.Error()
+		return Candidate{}, false
 	}
 	if len(paths) == 0 {
 		note(o, c, "no SCION paths")
-		return nil
+		ls.Err = "no SCION paths"
+		return Candidate{}, false
 	}
-	paths, failedOpen := filterByPolicy(paths, c.Policy)
-	if failedOpen {
-		note(o, c, "scion-policy thresholds exclude every path; ignored (fail-open)")
+	// All eligible paths, in the deterministic order of the selection.
+	set, excl := selectPathSet(paths, pathSetParams{
+		K: len(paths), Now: time.Now(), DstHostLen: hostLen(host), SrcHostLen: srcLen, AllowSoon: true,
+	})
+	for _, e := range excl {
+		ls.Excluded = append(ls.Excluded, e.Fingerprint+": "+e.Reason)
 	}
-	rankPaths(paths, c.Policy)
-	if len(paths) > k {
-		paths = paths[:k]
+	if len(set) == 0 {
+		note(o, c, "no eligible SCION path (expired or MTU too small)")
+		ls.Err = "no eligible path"
+		return Candidate{}, false
 	}
-	out := make([]Candidate, 0, len(paths))
-	for i, p := range paths {
-		md := p.Metadata()
-		nc := c
-		nc.Label = fmt.Sprintf("%s#p%d", c.Label, i+1)
-		nc.Path = &SCIONPath{
-			Fingerprint: snet.Fingerprint(md.Interfaces).String(),
-			Latency:     knownLatency(md),
-			Hops:        len(md.Interfaces),
-			SNET:        p,
-		}
-		out = append(out, nc)
+	nc.PathSet = make([]SCIONPath, len(set))
+	for i, rp := range set {
+		nc.PathSet[i] = rp.toSCIONPath()
+		ls.PathSet = append(ls.PathSet, nc.PathSet[i].Interfaces)
 	}
-	return out
+	nc.Path = &nc.PathSet[0]
+	return nc, true
 }
 
 // fallbackNoDaemon maps each proto-candidate to one ViaScitra candidate when an
@@ -334,7 +564,12 @@ func scitraCandidate(c Candidate) (Candidate, error) {
 	nc.ViaScitra = true
 	nc.Host = mapped.String()
 	nc.Path = nil
+	// Keep the suffix that tells apart endpoints with the same SCION
+	// address (scionLabel), so that they stay distinct after the mapping.
 	nc.Label = "scitra:" + c.IA + "," + mapped.String()
+	if suffix, ok := strings.CutPrefix(c.Label, "scion:"+c.IA+","+c.Host); ok {
+		nc.Label += suffix
+	}
 	return nc, nil
 }
 
@@ -344,176 +579,29 @@ func note(o DialerOptions, c Candidate, detail string) {
 	}
 }
 
-// knownLatency sums the advertised (non-negative) per-hop latencies; unset
-// (negative) entries are skipped.
-func knownLatency(md *snet.PathMetadata) time.Duration {
-	var total time.Duration
-	for _, d := range md.Latency {
-		if d >= 0 {
-			total += d
-		}
-	}
-	return total
-}
-
-// pathKey is the ranking/filtering projection of a path's metadata: the
-// aggregate metrics rankPaths and filterByPolicy compare paths on.
-type pathKey struct {
-	latUnset bool
-	lat      time.Duration
-	bwUnset  bool
-	bw       uint64 // bottleneck: minimum announced hop bandwidth
-	hops     int
-	fp       string
-}
-
-func pathKeyOf(p snet.Path) pathKey {
-	md := p.Metadata()
-	k := pathKey{hops: len(md.Interfaces), fp: snet.Fingerprint(md.Interfaces).String()}
-	for _, d := range md.Latency {
-		if d < 0 {
-			k.latUnset = true
-		} else {
-			k.lat += d
-		}
-	}
-	if len(md.Bandwidth) == 0 {
-		k.bwUnset = true
-	}
-	for _, bw := range md.Bandwidth {
-		if bw == 0 {
-			k.bwUnset = true
-			continue
-		}
-		if k.bw == 0 || bw < k.bw {
-			k.bw = bw
-		}
-	}
-	return k
-}
-
-// metricCmp compares two paths on one metric; negative = a first. A path
-// missing the metric always sorts after one that has it; bandwidth is
-// better when larger.
-func metricCmp(a, b pathKey, m PolicyMetric) int {
-	switch m {
-	case MetricLatency:
-		switch {
-		case a.latUnset && b.latUnset:
-			return 0
-		case a.latUnset:
-			return 1
-		case b.latUnset:
-			return -1
-		case a.lat != b.lat:
-			if a.lat < b.lat {
-				return -1
-			}
-			return 1
-		}
-	case MetricBandwidth:
-		switch {
-		case a.bwUnset && b.bwUnset:
-			return 0
-		case a.bwUnset:
-			return 1
-		case b.bwUnset:
-			return -1
-		case a.bw != b.bw:
-			if a.bw > b.bw {
-				return -1
-			}
-			return 1
-		}
-	case MetricHops:
-		if a.hops != b.hops {
-			return a.hops - b.hops
-		}
-	}
-	return 0
-}
-
-// rankPaths orders paths by the policy's preference metrics (default:
-// latency then hops), with the remaining default metrics as trailing
-// tie-breaks and the fingerprint as the deterministic last resort.
-func rankPaths(paths []snet.Path, policy *PathPolicy) {
-	prefer := []PolicyMetric{MetricLatency, MetricHops}
-	if policy != nil && len(policy.Prefer) > 0 {
-		prefer = append([]PolicyMetric(nil), policy.Prefer...)
-		for _, m := range []PolicyMetric{MetricLatency, MetricHops} {
-			found := false
-			for _, p := range prefer {
-				if p == m {
-					found = true
-				}
-			}
-			if !found {
-				prefer = append(prefer, m)
-			}
-		}
-	}
-	keys := make([]pathKey, len(paths))
-	for i, p := range paths {
-		keys[i] = pathKeyOf(p)
-	}
-	idx := make([]int, len(paths))
-	for i := range idx {
-		idx[i] = i
-	}
-	sort.SliceStable(idx, func(i, j int) bool {
-		a, b := keys[idx[i]], keys[idx[j]]
-		for _, m := range prefer {
-			if c := metricCmp(a, b, m); c != 0 {
-				return c < 0
-			}
-		}
-		return a.fp < b.fp
-	})
-	sorted := make([]snet.Path, len(paths))
-	for i, j := range idx {
-		sorted[i] = paths[j]
-	}
-	copy(paths, sorted)
-}
-
-// filterByPolicy drops paths that provably violate a threshold item; a
-// path missing the relevant metric cannot violate it. If every path
-// violates, thresholds are ignored entirely (draft fail-open MUST) and
-// failedOpen reports it so the caller can leave a timeline note.
-func filterByPolicy(paths []snet.Path, policy *PathPolicy) ([]snet.Path, bool) {
-	if policy == nil || (policy.MaxLatency == 0 && policy.MinBandwidthKbps == 0) {
-		return paths, false
-	}
-	var kept []snet.Path
-	for _, p := range paths {
-		k := pathKeyOf(p)
-		if policy.MaxLatency > 0 && !k.latUnset && k.lat > policy.MaxLatency {
-			continue
-		}
-		if policy.MinBandwidthKbps > 0 && !k.bwUnset && k.bw < policy.MinBandwidthKbps {
-			continue
-		}
-		kept = append(kept, p)
-	}
-	if len(kept) == 0 {
-		return paths, true
-	}
-	return kept, false
-}
-
-// dialSCION dials native HTTP/3 over SCION QUIC on the candidate's pinned path.
+// dialSCION attempts a native HTTP/3 over SCION QUIC connection to the
+// candidate's SCION endpoint. The candidate paths are selected now, from
+// the candidate's paths that are eligible now; if there is none, the error
+// is errNoEligiblePath and no attempt was started.
 //
-// It dials quic-go directly over an snet.Conn (quic.Transport{Conn: snetConn})
-// rather than pkg/snet/squic: squic.ConnDialer wraps the QUIC session as a
-// single-stream net.Conn for control-plane RPC, whereas HTTP/3 needs the raw
-// *quic.Conn. The remote *snet.UDPAddr pins the dataplane path and next hop.
+// In the default mode (PathModeAttempts) a separate QUIC connection is
+// attempted over each candidate path (attempts.go). In PathModeCopy the
+// candidate paths are raced within one QUIC connection (racer.go).
+//
+// quic-go is dialed directly over an snet.Conn rather than through
+// pkg/snet/squic: HTTP/3 needs the raw *quic.Conn, and the wrapper around
+// the snet.Conn decides which SCION path each datagram goes out on.
 func dialSCION(ctx context.Context, c Candidate, o DialerOptions) (*Established, error) {
-	if c.Path == nil {
-		return nil, errors.New("hev3: dial scion: candidate has no pinned path")
+	if len(c.PathSet) == 0 {
+		return nil, errors.New("hev3: dial scion: candidate has no paths")
 	}
-	p, ok := c.Path.SNET.(snet.Path)
-	if !ok {
-		return nil, fmt.Errorf("hev3: dial scion: pinned path is %T, not snet.Path", c.Path.SNET)
+	known := make([]snet.Path, 0, len(c.PathSet))
+	for i, sp := range c.PathSet {
+		p, ok := sp.SNET.(snet.Path)
+		if !ok {
+			return nil, fmt.Errorf("hev3: dial scion: path %d is %T, not snet.Path", i+1, sp.SNET)
+		}
+		known = append(known, p)
 	}
 	dstIA, err := addr.ParseIA(c.IA)
 	if err != nil {
@@ -523,14 +611,15 @@ func dialSCION(ctx context.Context, c Candidate, o DialerOptions) (*Established,
 	if err != nil {
 		return nil, fmt.Errorf("hev3: dial scion: bad host %q: %w", c.Host, err)
 	}
+	setupStart := time.Now()
 
 	// With a shared scionContext (o.SCION != nil) the daemon connect,
 	// topology load, and local-IP resolution happen at most once per Fetch
-	// (F12) and this call must never close that shared connector — it is
+	// (F12) and this call must never close that shared connector - it is
 	// owned by o.SCION and released by scionContext.Close. With no shared
 	// context (library callers, existing tests) this call owns the daemon
-	// connection exactly as before: connect/load/resolve inline and close
-	// it on every error path and on Established.Close.
+	// connection: connect/load/resolve inline and close it on every error
+	// path and on Established.Close.
 	var (
 		sciond   daemon.Connector
 		topo     snet.Topology
@@ -559,45 +648,184 @@ func dialSCION(ctx context.Context, c Candidate, o DialerOptions) (*Established,
 			return nil, fmt.Errorf("hev3: dial scion: resolving local IP: %w", err)
 		}
 	}
-
-	sn := &snet.SCIONNetwork{
-		Topology: topo,
-		SCMPHandler: snet.SCMPPropagationStopper{
-			Handler: snet.DefaultSCMPHandler{
-				RevocationHandler: daemon.RevHandler{Connector: sciond},
-			},
-		},
-	}
-	conn, err := sn.Listen(ctx, "udp", &net.UDPAddr{IP: localIP, Port: 0})
-	if err != nil {
+	closeDaemon := func() {
 		if ownsConn {
 			_ = sciond.Close()
 		}
-		return nil, fmt.Errorf("hev3: dial scion: opening socket: %w", err)
 	}
 
-	tr := &quic.Transport{Conn: conn}
-	remote := &snet.UDPAddr{
-		IA:      dstIA,
-		Host:    net.UDPAddrFromAddrPort(netip.AddrPortFrom(host, c.Port)),
-		Path:    p.Dataplane(),
-		NextHop: p.UnderlayNextHop(),
+	// Candidate paths: selected at the time of the attempt.
+	copyMode := o.PathMode == PathModeCopy
+	k := o.K
+	if k <= 0 {
+		k = defaultK
 	}
-	qconn, err := tr.Dial(ctx, remote, h3TLSConfig(o.TLS, host.String()), nil)
-	if err != nil {
-		_ = tr.Close()
-		_ = conn.Close()
-		if ownsConn {
-			_ = sciond.Close()
+	params := pathSetParams{K: k, Now: time.Now(), DstHostLen: hostLen(host), SrcHostLen: 16}
+	if a, ok := netip.AddrFromSlice(localIP); ok {
+		params.SrcHostLen = hostLen(a)
+	}
+	if copyMode {
+		params.Down = scmpDownCache
+	} else {
+		params.Random = !o.DeterministicPaths
+	}
+	set, _ := selectPathSet(known, params)
+	if len(set) == 0 {
+		closeDaemon()
+		return nil, fmt.Errorf("hev3: dial scion %s,%s: %w", c.IA, c.Host, errNoEligiblePath)
+	}
+	paths := make([]snet.Path, len(set))
+	for i, rp := range set {
+		paths[i] = rp.p
+		if o.ExpCorruptPath == i+1 {
+			paths[i] = corruptFirstHopMAC(rp.p)
 		}
+	}
+
+	remote := &snet.UDPAddr{IA: dstIA, Host: net.UDPAddrFromAddrPort(netip.AddrPortFrom(host, c.Port))}
+	tlsConf := h3TLSConfig(o.TLS, host.String())
+	if !copyMode {
+		// Default 50 ms, not below 10 ms, not above the Connection Attempt
+		// Delay in use.
+		delay := pathAttemptDelay(o.PathAttemptDelay, attemptDelayFrom(ctx))
+		res, err := dialAttempts(ctx, attemptsDial{
+			Remote: remote, Paths: paths, Delay: delay, Topology: topo, LocalIP: localIP,
+			TLS: tlsConf, Linger: o.Linger, OnStart: pathStartHookFrom(ctx), Reserve: pathAttemptGateFrom(ctx), BG: o.BG,
+		})
+		st := SCIONAttemptStats{
+			Label: c.Label, Remote: remote.String(), Mode: PathModeAttempts,
+			PathAttemptDelayMs: msec(delay),
+			SetupMs:            msec(time.Since(setupStart) - res.handshake),
+			HandshakeMs:        msec(res.handshake),
+		}
+		if err != nil {
+			st.Err = err.Error()
+		}
+		set := res.set
+		o.Stats.addAttemptFunc(func() SCIONAttemptStats {
+			out := st
+			out.Winner, out.Paths = set.snapshot()
+			return out
+		})
+		if err != nil {
+			closeDaemon()
+			return nil, fmt.Errorf("hev3: dial scion %s: %w", remote, err)
+		}
+		tr, pc := res.tr, res.pc
+		return newH3Established(c, res.conn, func() error {
+			_ = tr.Close()
+			err := pc.Close()
+			closeDaemon()
+			return err
+		}), nil
+	}
+
+	delays, srcs := pathDelays(o.PathDelay, paths, pathRTTHistory, time.Now(), attemptDelayFrom(ctx))
+	res, err := dialRacing(ctx, racingDial{
+		Remote:     remote,
+		Paths:      paths,
+		PathDelays: delays,
+		DelaySrcs:  srcs,
+		Topology:   topo,
+		LocalIP:    localIP,
+		TLS:        tlsConf,
+	})
+	st := SCIONAttemptStats{
+		Label: c.Label, Remote: remote.String(), Mode: PathModeCopy,
+		SetupMs: msec(time.Since(setupStart) - res.handshake), HandshakeMs: msec(res.handshake),
+	}
+	if res.racer != nil {
+		rs := res.racer.Stats()
+		st.Racer = &rs
+	}
+	if err != nil {
+		closeDaemon()
+		st.Err = err.Error()
+		o.Stats.addAttempt(st)
 		return nil, fmt.Errorf("hev3: dial scion %s: %w", remote, err)
 	}
+	o.Stats.addAttempt(st)
+	tr, racer, qconn := res.tr, res.racer, res.conn
 	return newH3Established(c, qconn, func() error {
+		recordHistory(pathRTTHistory, racer, qconn.ConnectionStats(), time.Now())
 		_ = tr.Close()
-		_ = conn.Close()
-		if ownsConn {
-			return sciond.Close()
-		}
-		return nil
+		err := racer.Close()
+		closeDaemon()
+		return err
 	}), nil
+}
+
+// racingDial is the input of dialRacing.
+type racingDial struct {
+	Remote *snet.UDPAddr // remote IA + host:port
+	Paths  []snet.Path   // ranked path set
+	// PathDelays[i] follows the adding of Paths[i]; nil = PathDelay for
+	// every path, and PathDelay <= 0 adds all paths at once.
+	PathDelays []time.Duration
+	DelaySrcs  []string
+	PathDelay  time.Duration
+	Topology   snet.Topology
+	LocalIP    net.IP
+	TLS        *tls.Config
+	Down       *downCache // nil = the process-wide SCMP down cache
+}
+
+type racingResult struct {
+	conn      *quic.Conn
+	tr        *quic.Transport
+	racer     *pathRacer // non-nil once the socket is open (also on failure, for stats)
+	handshake time.Duration
+}
+
+// dialRacing opens a dispatcherless SCION socket and dials one QUIC
+// connection over a pathRacer racing d.Paths. On error everything is
+// closed. Separate from dialSCION (daemon, candidate, stats) so tests can
+// drive it over an emulated network.
+func dialRacing(ctx context.Context, d racingDial) (racingResult, error) {
+	var res racingResult
+	dctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil) // quic-go uses the dial context for the handshake only
+	racer := newPathRacer(racerConfig{
+		Remote:     d.Remote,
+		Paths:      d.Paths,
+		PathDelays: d.PathDelays,
+		DelaySrcs:  d.DelaySrcs,
+		PathDelay:  d.PathDelay,
+		Fail:       cancel,
+		Down:       d.Down,
+	})
+	// Dispatcherless snet (v0.12+): a concrete local IP, port 0 = a free
+	// port from the topology's dispatched_ports range.
+	sn := &snet.SCIONNetwork{Topology: d.Topology, SCMPHandler: racer}
+	conn, err := sn.Listen(ctx, "udp", &net.UDPAddr{IP: d.LocalIP, Port: 0})
+	if err != nil {
+		_ = racer.Close()
+		return res, fmt.Errorf("opening socket: %w", err)
+	}
+	racer.under = conn
+	res.racer = racer
+
+	tr := &quic.Transport{Conn: racer}
+	// The dial address carries the top-ranked path; the racer overrides the
+	// path per datagram. quic-go compares addresses by String(), which
+	// omits the path.
+	dialAddr := &snet.UDPAddr{
+		IA:      d.Remote.IA,
+		Host:    d.Remote.Host,
+		Path:    d.Paths[0].Dataplane(),
+		NextHop: d.Paths[0].UnderlayNextHop(),
+	}
+	start := time.Now()
+	// InitialPacketSize pinned to the 1200-octet minimum, so the path MTU
+	// check of selectPathSet matches what is sent.
+	qconn, err := tr.Dial(dctx, dialAddr, d.TLS, &quic.Config{InitialPacketSize: quicMinDatagram})
+	res.handshake = time.Since(start)
+	if err != nil {
+		_ = tr.Close()
+		_ = racer.Close()
+		return res, err
+	}
+	racer.markEstablished()
+	res.conn, res.tr = qconn, tr
+	return res, nil
 }

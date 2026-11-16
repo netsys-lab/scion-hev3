@@ -138,8 +138,8 @@ func TestFetch_SCIONOnlyInitialWithLateAStillFetches(t *testing.T) {
 	// releases via §4.2 gate path (a) — SVCB+AAAA final — with only the
 	// SCION candidate; A only shows up on a later Update, now as a v4:/
 	// v4+tcp: pair (Task 7).
-	f.set("sciononly.test.", dns.TypeSVCB, mustRR(t,
-		`sciononly.test. 300 IN SVCB 1 . alpn=h3 scion=1-150\\,10.20.3.215`))
+	f.set("sciononly.test.", dns.TypeHTTPS, mustRR(t,
+		`sciononly.test. 300 IN HTTPS 1 . alpn=h3 scion=1-150_10.20.3.215`))
 	f.set("sciononly.test.", dns.TypeA, mustRR(t, fmt.Sprintf("sciononly.test. 300 IN A %s", tcp.IP.String())))
 	f.setDelay("sciononly.test.", dns.TypeA, 150*time.Millisecond)
 
@@ -288,5 +288,28 @@ func TestBuildTLSConfig_ServerNameFromHostname(t *testing.T) {
 	}
 	if _, ok := interface{}(cfg).(*tls.Config); !ok {
 		t.Errorf("buildTLSConfig did not return a *tls.Config")
+	}
+}
+
+func TestParseSCIONTarget(t *testing.T) {
+	c, err := parseSCIONTarget("1-152,10.152.0.81:8443", 443)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Family != FamilySCION || c.IA != "1-152" || c.Host != "10.152.0.81" || c.Port != 8443 || c.ALPN[0] != "h3" {
+		t.Fatalf("got %+v", c)
+	}
+	c, err = parseSCIONTarget("1-ff00:0:110,[2001:db8::1]:443", 1)
+	if err != nil || c.Host != "2001:db8::1" || c.Port != 443 || c.IA != "1-ff00:0:110" {
+		t.Fatalf("IPv6: %+v %v", c, err)
+	}
+	c, err = parseSCIONTarget("1-152,10.152.0.81", 443)
+	if err != nil || c.Port != 443 {
+		t.Fatalf("default port: %+v %v", c, err)
+	}
+	for _, bad := range []string{"10.152.0.81:443", "x,10.152.0.81", "1-152,host:443"} {
+		if _, err := parseSCIONTarget(bad, 443); err == nil {
+			t.Errorf("parseSCIONTarget(%q) accepted", bad)
+		}
 	}
 }

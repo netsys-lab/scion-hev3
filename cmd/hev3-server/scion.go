@@ -67,8 +67,9 @@ func scionLocalIP(flagVal string, auto func() (net.IP, error)) (net.IP, error) {
 
 // newSCIONServer sets up the SCION QUIC HTTP/3 listener on the given underlay
 // port using the local sciond at daemonAddr. bindIP, when non-empty, pins the
-// underlay bind address instead of deriving it from sciond.
-func newSCIONServer(ctx context.Context, handler http.Handler, cert tls.Certificate, daemonAddr string, bindIP string, port int) (*scionServer, error) {
+// underlay bind address instead of deriving it from sciond. cl, when not nil,
+// gets one record per connection (see connLog).
+func newSCIONServer(ctx context.Context, handler http.Handler, cert tls.Certificate, daemonAddr string, bindIP string, port int, cl *connLog) (*scionServer, error) {
 	sciond, err := daemon.NewService(daemonAddr).Connect(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to daemon %s: %w", daemonAddr, err)
@@ -111,7 +112,11 @@ func newSCIONServer(ctx context.Context, handler http.Handler, cert tls.Certific
 		Certificates: []tls.Certificate{cert},
 		NextProtos:   []string{"h3"},
 	}
-	ln, err := tr.Listen(tlsConf, &quic.Config{})
+	qconf := &quic.Config{}
+	if cl != nil {
+		qconf.Tracer = cl.tracer
+	}
+	ln, err := tr.Listen(tlsConf, qconf)
 	if err != nil {
 		_ = tr.Close()
 		_ = conn.Close()
