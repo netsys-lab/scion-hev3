@@ -71,6 +71,13 @@ type Options struct {
 	// 10ms are raised to 10ms, values above the Connection Attempt Delay
 	// are lowered to it.
 	PathAttemptDelay time.Duration
+	// PathAttemptDelayDerived (PathModeAttempts) derives the Path Attempt
+	// Delay instead of using PathAttemptDelay: the delay that follows the
+	// start of an attempt over a path is smoothed RTT + 2*RTT variation
+	// of that path, from the connections established over it earlier in
+	// the same process (within 10 minutes); without such history, 50ms.
+	// Kept within [10ms, Connection Attempt Delay].
+	PathAttemptDelayDerived bool
 	// Linger bounds how long a cancelled path attempt goes on so that its
 	// connection can be closed with CONNECTION_CLOSE. 0 => twice the time
 	// the attempts took, within [50ms, 1s]; negative => dropped at once.
@@ -97,6 +104,12 @@ type Options struct {
 	Session *Session
 	// ExpCorruptPath (experiments only): see DialerOptions.ExpCorruptPath.
 	ExpCorruptPath int
+	// ExpSamePath (experiments only, PathModeAttempts) makes the second
+	// and further attempts to a SCION endpoint use its first candidate
+	// path again instead of the next candidate path: still a separate
+	// connection from its own local port, one Path Attempt Delay apart,
+	// and as many attempts as there are candidate paths.
+	ExpSamePath bool
 	// ExpRefreshPaths (experiments only): see DialerOptions.ExpRefreshPaths.
 	ExpRefreshPaths bool
 }
@@ -175,7 +188,8 @@ func Fetch(ctx context.Context, rawURL string, o Options) (*Result, error) {
 	dOpts := DialerOptions{
 		TLS: tlsConfig, K: o.K, Timeline: tl, DaemonAddr: o.DaemonAddr,
 		PathDelay: o.PathDelay, ExpCorruptPath: o.ExpCorruptPath, ExpRefreshPaths: o.ExpRefreshPaths, Stats: stats,
-		PathMode: o.PathMode, PathAttemptDelay: o.PathAttemptDelay, Linger: o.Linger,
+		PathMode: o.PathMode, PathAttemptDelay: o.PathAttemptDelay, PathAttemptDelayDerived: o.PathAttemptDelayDerived,
+		ExpSamePath: o.ExpSamePath, Linger: o.Linger,
 		DeterministicPaths: o.DeterministicPaths, MaxDestinationASes: o.MaxDestinationASes,
 		Lookups: &lookupGroup{}, BG: &sync.WaitGroup{},
 	}

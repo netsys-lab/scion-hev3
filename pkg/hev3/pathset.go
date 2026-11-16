@@ -310,7 +310,8 @@ type pathSetExclusion struct {
 //     and UDP headers;
 //   - paths with the same inter-AS links are one path, with the latest of
 //     their expiry times;
-//   - paths expiring within pathExpiryMargin only when no other is left;
+//   - a path expiring within pathExpiryMargin is selected only when no
+//     other path is left to select;
 //   - ranking is greedy: first the path with the fewest AS hops, then
 //     repeatedly the path with the least overlap with those already
 //     selected. Overlap is compared by the number of shared transit ASes,
@@ -325,22 +326,23 @@ func selectPathSet(paths []snet.Path, o pathSetParams) ([]rankedPath, []pathSetE
 		o.K = defaultK
 	}
 	fresh, soon, excl := eligiblePaths(paths, o)
-	pool := fresh
-	if o.AllowSoon {
-		ranked := rankGreedy(fresh, o.K)
-		return append(ranked, rankGreedy(soon, o.K-len(ranked))...), excl
+	if o.Random {
+		rand.Shuffle(len(fresh), func(i, j int) { fresh[i], fresh[j] = fresh[j], fresh[i] })
+		rand.Shuffle(len(soon), func(i, j int) { soon[i], soon[j] = soon[j], soon[i] })
 	}
-	if len(pool) == 0 {
-		pool = soon
-	} else {
+	ranked := rankGreedy(fresh, o.K, soon)
+	if !o.AllowSoon {
+		selected := map[string]bool{}
+		for _, rp := range ranked {
+			selected[rp.fp] = true
+		}
 		for _, rp := range soon {
-			excl = append(excl, pathSetExclusion{rp.fp, "expires within " + pathExpiryMargin.String()})
+			if !selected[rp.fp] {
+				excl = append(excl, pathSetExclusion{rp.fp, "expires within " + pathExpiryMargin.String()})
+			}
 		}
 	}
-	if o.Random {
-		rand.Shuffle(len(pool), func(i, j int) { pool[i], pool[j] = pool[j], pool[i] })
-	}
-	return rankGreedy(pool, o.K), excl
+	return ranked, excl
 }
 
 // eligiblePaths returns the eligible paths among paths, one per set of
@@ -408,7 +410,7 @@ func eligiblePaths(paths []snet.Path, o pathSetParams) (fresh, soon []rankedPath
 }
 
 // rankGreedy picks up to k paths from pool in rank order (see selectPathSet).
-func rankGreedy(pool []rankedPath, k int) []rankedPath {
+func rankGreedy(pool []rankedPath, k int, later ...[]rankedPath) []rankedPath {
 	rem := append([]rankedPath(nil), pool...)
 	usedLinks := map[linkKey]bool{}
 	usedPairs := map[asPair]bool{}
@@ -433,7 +435,14 @@ func rankGreedy(pool []rankedPath, k int) []rankedPath {
 		return o
 	}
 	var out []rankedPath
-	for len(out) < k && len(rem) > 0 {
+	for len(out) < k {
+		// A later pool is used only when the pools before it are used up.
+		for len(rem) == 0 && len(later) > 0 {
+			rem, later = append([]rankedPath(nil), later[0]...), later[1:]
+		}
+		if len(rem) == 0 {
+			break
+		}
 		best := 0
 		bestShared := shared(rem[0])
 		for i := 1; i < len(rem); i++ {
@@ -584,6 +593,31 @@ func hopPairsEqual(a, b []hopPair) bool {
 	return true
 }
 
+// attemptPaths returns the path of each attempt to an endpoint, in attempt
+// order, for the ranked candidate paths set. corrupt > 0 corrupts the
+// candidate path with that 1-based rank (corruptFirstHopMAC). samePath
+// (an experiment) makes every attempt use candidate path 1 (each with its
+// own copy of the dataplane path, see ownDataplane), as many attempts as
+// there are candidate paths: with corrupt == 1 every attempt is then
+// corrupted, with corrupt > 1 none is.
+func attemptPaths(set []rankedPath, corrupt int, samePath bool) []snet.Path {
+	paths := make([]snet.Path, len(set))
+	for i, rp := range set {
+		// Endpoints in one AS share the paths of one lookup, so every
+		// attempt gets its own copy of the dataplane path.
+		paths[i] = ownDataplane(rp.p)
+		if corrupt == i+1 {
+			paths[i] = corruptFirstHopMAC(rp.p)
+		}
+	}
+	if samePath {
+		for i := 1; i < len(paths); i++ {
+			paths[i] = ownDataplane(paths[0])
+		}
+	}
+	return paths
+}
+
 // corruptFirstHopMAC returns a copy of p whose first hop field has one MAC
 // byte flipped, so the first border router drops it (it answers with an
 // SCMP Parameter Problem, not an interface-down error). For experiments
@@ -611,14 +645,27 @@ func corruptFirstHopMAC(p snet.Path) snet.Path {
 	}
 	raw := append([]byte(nil), sp.Raw...)
 	raw[off] ^= 0xff
-	return corruptedPath{Path: p, dp: snetpath.SCION{Raw: raw}}
+	return overriddenPath{Path: p, dp: snetpath.SCION{Raw: raw}}
 }
 
-// corruptedPath overrides the dataplane of a path; everything else
+// ownDataplane returns p with a copy of its SCION dataplane path. snet
+// rewrites the path meta header inside the dataplane buffer on every send,
+// so connections that send over the same path at the same time must not
+// share that buffer. Paths that are not of the SCION type are returned
+// unchanged.
+func ownDataplane(p snet.Path) snet.Path {
+	sp, ok := p.Dataplane().(snetpath.SCION)
+	if !ok {
+		return p
+	}
+	return overriddenPath{Path: p, dp: snetpath.SCION{Raw: append([]byte(nil), sp.Raw...)}}
+}
+
+// overriddenPath overrides the dataplane of a path; everything else
 // (metadata, next hop) is the original's.
-type corruptedPath struct {
+type overriddenPath struct {
 	snet.Path
 	dp snet.DataplanePath
 }
 
-func (c corruptedPath) Dataplane() snet.DataplanePath { return c.dp }
+func (c overriddenPath) Dataplane() snet.DataplanePath { return c.dp }

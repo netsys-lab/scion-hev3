@@ -142,19 +142,28 @@ func TestSelectPathSet_LatencyTieBreakAndK(t *testing.T) {
 	}
 }
 
-// Expired paths are never selected; paths expiring within 2s only when no
-// other path is left.
+// Expired paths are never selected. A path expiring within pathExpiryMargin
+// is selected only when no other path is left to select: it fills a slot
+// that the other paths leave open, and is not selected when they fill all.
 func TestSelectPathSet_Expiry(t *testing.T) {
 	now := time.Now()
 	expired := hopsPath(hopsSpec{ases: []string{"1-1", "1-9"}, ifBase: 1, expiry: now.Add(-time.Second)})
 	soon := hopsPath(hopsSpec{ases: []string{"1-1", "1-9"}, ifBase: 3, expiry: now.Add(time.Second)})
 	fresh := hopsPath(hopsSpec{ases: []string{"1-1", "1-2", "1-9"}, ifBase: 5})
-	got, excl := selectPathSet([]snet.Path{expired, soon, fresh}, pathSetParams{K: 3, Now: now})
+	got, excl := selectPathSet([]snet.Path{expired, soon, fresh}, pathSetParams{K: 1, Now: now})
 	if len(got) != 1 || !samePath(got[0].p, fresh) {
 		t.Fatalf("set = %v, want only the fresh path", setIfaces(got))
 	}
 	if len(excl) != 2 {
 		t.Errorf("exclusions = %+v, want expired + expiring", excl)
+	}
+	// The expiring path has fewer AS hops, but comes after the fresh one.
+	got, excl = selectPathSet([]snet.Path{expired, soon, fresh}, pathSetParams{K: 2, Now: now})
+	if len(got) != 2 || !samePath(got[0].p, fresh) || !samePath(got[1].p, soon) {
+		t.Fatalf("set = %v, want [fresh expiring]", setIfaces(got))
+	}
+	if len(excl) != 1 {
+		t.Errorf("exclusions = %+v, want expired only", excl)
 	}
 	got, _ = selectPathSet([]snet.Path{expired, soon}, pathSetParams{K: 3, Now: now})
 	if len(got) != 1 || !samePath(got[0].p, soon) {
@@ -229,6 +238,44 @@ func TestPathDelayFor(t *testing.T) {
 	}
 }
 
+// Derived Path Attempt Delay: smoothed_rtt + 2*rttvar of the path from
+// history, else the default 50 ms; within [10 ms, Connection Attempt
+// Delay]. Without derived, the configured (or default) value is fixed.
+func TestPathAttemptDelays(t *testing.T) {
+	now := time.Unix(1000, 0)
+	hist := newRTTHistory()
+	p := func(id uint64) snet.Path { return makePath(nil, []uint64{id, id + 1}) }
+	hist.record(pathFingerprint(p(1)), 20*ms, 3*ms, now)
+	hist.record(pathFingerprint(p(3)), 2*ms, ms, now)
+	hist.record(pathFingerprint(p(5)), 200*ms, 50*ms, now)
+	hist.record(pathFingerprint(p(7)), 20*ms, 3*ms, now.Add(-rttHistoryTTL))
+	paths := []snet.Path{p(1), p(3), p(5), p(7), p(9)}
+
+	ds, srcs := pathAttemptDelays(0, true, paths, hist, now, 250*ms)
+	want := []time.Duration{26 * ms, 10 * ms, 250 * ms, 50 * ms, 50 * ms}
+	wantSrc := []string{delaySrcHistory, delaySrcHistory, delaySrcHistory, delaySrcDefault, delaySrcDefault}
+	for i := range paths {
+		if ds[i] != want[i] || srcs[i] != wantSrc[i] {
+			t.Errorf("derived, path %d: %v (%s), want %v (%s)", i+1, ds[i], srcs[i], want[i], wantSrc[i])
+		}
+	}
+	// The default without history is still capped by the Connection
+	// Attempt Delay.
+	if ds, _ := pathAttemptDelays(0, true, paths[4:], hist, now, 20*ms); ds[0] != 20*ms {
+		t.Errorf("derived default under a 20ms Connection Attempt Delay = %v, want 20ms", ds[0])
+	}
+	ds, srcs = pathAttemptDelays(100*ms, false, paths, hist, now, 250*ms)
+	for i := range paths {
+		if ds[i] != 100*ms || srcs[i] != delaySrcFixed {
+			t.Errorf("fixed, path %d: %v (%s), want 100ms (fixed)", i+1, ds[i], srcs[i])
+		}
+	}
+	// Derived ignores the configured value.
+	if ds, srcs := pathAttemptDelays(100*ms, true, paths[:1], hist, now, 250*ms); ds[0] != 26*ms || srcs[0] != delaySrcHistory {
+		t.Errorf("derived with a configured value: %v (%s), want 26ms (history)", ds[0], srcs[0])
+	}
+}
+
 func TestRTTHistory_NoSample(t *testing.T) {
 	h := newRTTHistory()
 	h.record("p", 0, 0, time.Now())
@@ -294,6 +341,50 @@ func TestHopPairs_MatchAfterDoubleReversal(t *testing.T) {
 	}
 	if got, ok := hopPairsOf(snetpath.SCION{Raw: raw}); !ok || !hopPairsEqual(got, sent) {
 		t.Fatalf("hopPairsOf(SCION) = %v %v", got, ok)
+	}
+}
+
+// The paths of the attempts: -exp-corrupt-path N corrupts the candidate
+// path ranked N; with the same-path arm every attempt uses candidate path 1,
+// so N = 1 corrupts every attempt and N > 1 none.
+func TestAttemptPaths(t *testing.T) {
+	d := decodedPath(t)
+	raw := make([]byte, d.Len())
+	if err := d.SerializeTo(raw); err != nil {
+		t.Fatal(err)
+	}
+	set := []rankedPath{
+		{p: hopsPath(hopsSpec{ases: []string{"1-1", "1-9"}, ifBase: 1, raw: raw})},
+		{p: hopsPath(hopsSpec{ases: []string{"1-1", "1-9"}, ifBase: 3, raw: raw})},
+		{p: hopsPath(hopsSpec{ases: []string{"1-1", "1-9"}, ifBase: 5, raw: raw})},
+	}
+	corrupted := func(p snet.Path) bool { return !bytes.Equal(p.Dataplane().(snetpath.SCION).Raw, raw) }
+	for _, c := range []struct {
+		corrupt int
+		same    bool
+		want    []int  // candidate path (0-based) of each attempt
+		bad     []bool // corrupted attempts
+	}{
+		{0, false, []int{0, 1, 2}, []bool{false, false, false}},
+		{2, false, []int{0, 1, 2}, []bool{false, true, false}},
+		{0, true, []int{0, 0, 0}, []bool{false, false, false}},
+		{1, true, []int{0, 0, 0}, []bool{true, true, true}},
+		{2, true, []int{0, 0, 0}, []bool{false, false, false}},
+	} {
+		got := attemptPaths(set, c.corrupt, c.same)
+		if len(got) != len(set) {
+			t.Fatalf("corrupt %d same %v: %d attempts, want %d", c.corrupt, c.same, len(got), len(set))
+		}
+		for i, p := range got {
+			if !samePath(p, set[c.want[i]].p) || corrupted(p) != c.bad[i] {
+				t.Errorf("corrupt %d same %v: attempt %d = %s (corrupted %v), want path %d (corrupted %v)",
+					c.corrupt, c.same, i+1, interfacesString(p.Metadata()), corrupted(p), c.want[i]+1, c.bad[i])
+			}
+			// Each attempt sends from a dataplane buffer of its own.
+			if i > 0 && c.same && &p.Dataplane().(snetpath.SCION).Raw[0] == &got[0].Dataplane().(snetpath.SCION).Raw[0] {
+				t.Errorf("corrupt %d same %v: attempt %d shares the dataplane buffer of attempt 1", c.corrupt, c.same, i+1)
+			}
+		}
 	}
 }
 

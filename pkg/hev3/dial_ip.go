@@ -49,6 +49,10 @@ type DialerOptions struct {
 	// PathAttemptDelay is the time between the starts of the attempts over
 	// the candidate paths of one SCION endpoint; 0 => 50ms, below 10ms => 10ms.
 	PathAttemptDelay time.Duration
+	// PathAttemptDelayDerived (PathModeAttempts) derives the Path Attempt
+	// Delay per path instead of using PathAttemptDelay: see
+	// Options.PathAttemptDelayDerived.
+	PathAttemptDelayDerived bool
 	// Linger: how long a cancelled path attempt may go on so that it can be
 	// closed with CONNECTION_CLOSE (see attempts.go). 0 => derived;
 	// negative => cancelled attempts are dropped at once.
@@ -69,6 +73,9 @@ type DialerOptions struct {
 	// so border routers drop packets on it (Parameter Problem, not an
 	// interface-down SCMP).
 	ExpCorruptPath int
+	// ExpSamePath (experiments only, PathModeAttempts): see
+	// Options.ExpSamePath.
+	ExpSamePath bool
 	// ExpRefreshPaths (experiments only) makes every path lookup ask the
 	// SCION daemon to fetch the paths anew instead of answering from its
 	// cache.

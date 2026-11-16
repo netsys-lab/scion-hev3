@@ -57,6 +57,8 @@ type PathAttemptStats struct {
 	StartMs     float64     `json:"start_ms"`             // after the first attempt's start
 	LocalPort   int         `json:"local_port,omitempty"` // the attempt's own local port
 	HandshakeMs float64     `json:"handshake_ms"`         // this attempt's start to handshake done, failure or cancellation
+	DelayMs     float64     `json:"delay_ms,omitempty"`   // Path Attempt Delay that follows the start of this attempt (not set on the last path)
+	DelaySrc    string      `json:"delay_src,omitempty"`  // fixed (configured or default value) / history / default (derived delay, no history for the path)
 	Outcome     string      `json:"outcome"`              // won / closed (handshake done after the decision, CONNECTION_CLOSE sent) / cancelled / failed / not-started / in-progress
 	Err         string      `json:"error,omitempty"`
 	SentPkts    int         `json:"sent_pkts"`
@@ -68,16 +70,18 @@ type PathAttemptStats struct {
 
 // SCIONAttemptStats is the attempts to one SCION endpoint.
 type SCIONAttemptStats struct {
-	Label              string             `json:"label"`
-	Remote             string             `json:"remote"`
-	Mode               string             `json:"mode"`                            // attempts (one connection per candidate path) / copy (one connection, datagrams copied)
-	PathAttemptDelayMs float64            `json:"path_attempt_delay_ms,omitempty"` // attempts mode
-	Winner             int                `json:"winner,omitempty"`                // attempts mode: 1-based rank of the path whose attempt succeeded
-	HandshakeMs        float64            `json:"handshake_ms"`                    // first attempt's start to QUIC handshake done (or failure)
-	SetupMs            float64            `json:"setup_ms"`                        // daemon/topology setup and path selection before the first attempt
-	Err                string             `json:"error,omitempty"`
-	Paths              []PathAttemptStats `json:"path_attempts,omitempty"` // attempts mode
-	Racer              *RacerStats        `json:"racer,omitempty"`         // copy mode
+	Label               string             `json:"label"`
+	Remote              string             `json:"remote"`
+	Mode                string             `json:"mode"`                             // attempts (one connection per candidate path) / copy (one connection, datagrams copied)
+	PathAttemptDelayMs  float64            `json:"path_attempt_delay_ms,omitempty"`  // attempts mode: the Path Attempt Delay after the first attempt
+	PathAttemptDelaySrc string             `json:"path_attempt_delay_src,omitempty"` // attempts mode: its source (see PathAttemptStats.DelaySrc)
+	ExpSamePath         bool               `json:"exp_same_path,omitempty"`          // attempts mode, experiment: every attempt used candidate path 1
+	Winner              int                `json:"winner,omitempty"`                 // attempts mode: 1-based rank of the path whose attempt succeeded
+	HandshakeMs         float64            `json:"handshake_ms"`                     // first attempt's start to QUIC handshake done (or failure)
+	SetupMs             float64            `json:"setup_ms"`                         // daemon/topology setup and path selection before the first attempt
+	Err                 string             `json:"error,omitempty"`
+	Paths               []PathAttemptStats `json:"path_attempts,omitempty"` // attempts mode
+	Racer               *RacerStats        `json:"racer,omitempty"`         // copy mode
 }
 
 // LookupStats is one path lookup for a SCION endpoint.

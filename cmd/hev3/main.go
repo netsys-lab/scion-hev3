@@ -41,6 +41,7 @@ func run(args []string, stdout, stderr *os.File) int {
 	resolver := fs.String("resolver", "", "DNS resolver \"ip:port\"; empty = system resolver (/etc/resolv.conf)")
 	k := fs.Int("k", 2, "Path Attempt Count: the most candidate paths attempted for one SCION endpoint")
 	pathAttemptDelay := fs.Duration("path-attempt-delay", 50*time.Millisecond, "Path Attempt Delay: time between the starts of the attempts over the candidate paths of one SCION endpoint (at least 10ms, at most the Connection Attempt Delay)")
+	pathAttemptDelayDerived := fs.Bool("path-attempt-delay-derived", false, "derive the Path Attempt Delay that follows the start of an attempt over a path from that path's RTT history in this process (smoothed RTT + 2*RTT variation; 50ms without history; at least 10ms, at most the Connection Attempt Delay) instead of -path-attempt-delay")
 	pathMode := fs.String("path-mode", "attempts", `how the candidate paths of a SCION endpoint are used: "attempts" (a separate QUIC connection per path) or "copy" (one QUIC connection, datagrams copied to the paths; not in the draft)`)
 	familyOrder := fs.String("family-order", "scion-first", `where the SCION family is ordered: "scion-first" or "ip-first" (SCION after both IP families; path lookups are not waited for)`)
 	linger := fs.Duration("linger", 0, "how long a cancelled path attempt may go on so that it can be closed with CONNECTION_CLOSE (0 = twice the time the attempts took, within 50ms..1s; negative = drop at once)")
@@ -52,6 +53,7 @@ func run(args []string, stdout, stderr *os.File) int {
 	repeat := fs.Int("repeat", 1, "run the fetch this many times in one process (fresh connection each run)")
 	stats := fs.Bool("stats", false, "print SCION path lookup and path racing statistics per run")
 	corruptPath := fs.Int("exp-corrupt-path", 0, "EXPERIMENT: corrupt the first hop field MAC of path N (1-based rank) of each SCION path set")
+	samePath := fs.Bool("exp-same-path", false, "EXPERIMENT (-path-mode=attempts): the second and further attempts to a SCION endpoint use its first candidate path again instead of the next candidate path")
 	refreshPaths := fs.Bool("exp-refresh-paths", false, "EXPERIMENT: every path lookup asks the SCION daemon to fetch the paths anew instead of answering from its cache")
 	noSCION := fs.Bool("no-scion", false, "drop SCION candidates after resolve")
 	noIP := fs.Bool("no-ip", false, "drop IPv6/IPv4 candidates after resolve")
@@ -103,6 +105,11 @@ func run(args []string, stdout, stderr *os.File) int {
 		fs.Usage()
 		return 2
 	}
+	if *pathMode == hev3.PathModeCopy && (*samePath || *pathAttemptDelayDerived) {
+		fmt.Fprintln(stderr, "hev3: -exp-same-path and -path-attempt-delay-derived apply to -path-mode=attempts only")
+		fs.Usage()
+		return 2
+	}
 	if *familyOrder != "scion-first" && *familyOrder != "ip-first" {
 		fmt.Fprintln(stderr, `hev3: -family-order must be "scion-first" or "ip-first"`)
 		fs.Usage()
@@ -111,6 +118,13 @@ func run(args []string, stdout, stderr *os.File) int {
 	if *pathAttemptDelay < 10*time.Millisecond {
 		fmt.Fprintln(stderr, "hev3: -path-attempt-delay below 10ms; using 10ms")
 		*pathAttemptDelay = 10 * time.Millisecond
+	}
+	if *pathAttemptDelayDerived {
+		fs.Visit(func(f *flag.Flag) {
+			if f.Name == "path-attempt-delay" {
+				fmt.Fprintln(stderr, "hev3: -path-attempt-delay-derived is set; -path-attempt-delay is not used")
+			}
+		})
 	}
 	if *k > 3 {
 		fmt.Fprintln(stderr, "hev3: a Path Attempt Count above 3 is NOT RECOMMENDED")
@@ -143,32 +157,34 @@ func run(args []string, stdout, stderr *os.File) int {
 		defer session.Close()
 	}
 	opts := hev3.Options{
-		Resolver:             *resolver,
-		K:                    *k,
-		NoSCION:              *noSCION,
-		NoIP:                 *noIP,
-		Insecure:             *insecure,
-		CAFile:               *ca,
-		AttemptDelay:         *attemptDelay,
-		ResolutionDelay:      *resolutionDelay,
-		RRType:               rt,
-		PreferredFamilyCount: *pfc,
-		MinAttemptDelay:      *minAttemptDelay,
-		MaxAttemptDelay:      *maxAttemptDelay,
-		AdaptiveDelay:        *adaptive,
-		DaemonAddr:           *daemon,
-		IPFirst:              *familyOrder == "ip-first",
-		PathMode:             *pathMode,
-		PathAttemptDelay:     *pathAttemptDelay,
-		Linger:               *linger,
-		WaitLinger:           *stats || *jsonOut,
-		DeterministicPaths:   *fixedPaths,
-		MaxDestinationASes:   *maxASes,
-		PathDelay:            pd,
-		SCIONTarget:          *scionTarget,
-		Session:              session,
-		ExpCorruptPath:       *corruptPath,
-		ExpRefreshPaths:      *refreshPaths,
+		Resolver:                *resolver,
+		K:                       *k,
+		NoSCION:                 *noSCION,
+		NoIP:                    *noIP,
+		Insecure:                *insecure,
+		CAFile:                  *ca,
+		AttemptDelay:            *attemptDelay,
+		ResolutionDelay:         *resolutionDelay,
+		RRType:                  rt,
+		PreferredFamilyCount:    *pfc,
+		MinAttemptDelay:         *minAttemptDelay,
+		MaxAttemptDelay:         *maxAttemptDelay,
+		AdaptiveDelay:           *adaptive,
+		DaemonAddr:              *daemon,
+		IPFirst:                 *familyOrder == "ip-first",
+		PathMode:                *pathMode,
+		PathAttemptDelay:        *pathAttemptDelay,
+		PathAttemptDelayDerived: *pathAttemptDelayDerived,
+		Linger:                  *linger,
+		WaitLinger:              *stats || *jsonOut,
+		DeterministicPaths:      *fixedPaths,
+		MaxDestinationASes:      *maxASes,
+		PathDelay:               pd,
+		SCIONTarget:             *scionTarget,
+		Session:                 session,
+		ExpCorruptPath:          *corruptPath,
+		ExpSamePath:             *samePath,
+		ExpRefreshPaths:         *refreshPaths,
 	}
 
 	code := 0
@@ -398,7 +414,10 @@ func printStats(w *os.File, res *hev3.Result) {
 	}
 	for _, a := range res.SCIONAttempts {
 		if a.Racer == nil {
-			fmt.Fprintf(w, "endpoint %s -> %s: handshake %.1fms (setup %.1fms), %d candidate paths, path attempt delay %.0fms", a.Label, a.Remote, a.HandshakeMs, a.SetupMs, len(a.Paths), a.PathAttemptDelayMs)
+			fmt.Fprintf(w, "endpoint %s -> %s: handshake %.1fms (setup %.1fms), %d candidate paths, path attempt delay %.0fms (%s)", a.Label, a.Remote, a.HandshakeMs, a.SetupMs, len(a.Paths), a.PathAttemptDelayMs, a.PathAttemptDelaySrc)
+			if a.ExpSamePath {
+				fmt.Fprint(w, ", every attempt over path 1 (-exp-same-path)")
+			}
 			if a.Winner > 0 {
 				fmt.Fprintf(w, ", established over path %d", a.Winner)
 			}
@@ -412,6 +431,9 @@ func printStats(w *os.File, res *hev3.Result) {
 					fmt.Fprintf(w, "%s", p.Outcome)
 				} else {
 					fmt.Fprintf(w, "started at %.1fms from port %d, %s after %.1fms, sent %d pkts/%d B, recv %d pkts/%d B", p.StartMs, p.LocalPort, p.Outcome, p.HandshakeMs, p.SentPkts, p.SentBytes, p.RecvPkts, p.RecvBytes)
+				}
+				if p.DelayMs > 0 {
+					fmt.Fprintf(w, ", path attempt delay %.0fms (%s)", p.DelayMs, p.DelaySrc)
 				}
 				if p.Err != "" {
 					fmt.Fprintf(w, " (%s)", p.Err)

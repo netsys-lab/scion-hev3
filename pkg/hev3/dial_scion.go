@@ -674,29 +674,25 @@ func dialSCION(ctx context.Context, c Candidate, o DialerOptions) (*Established,
 		closeDaemon()
 		return nil, fmt.Errorf("hev3: dial scion %s,%s: %w", c.IA, c.Host, errNoEligiblePath)
 	}
-	paths := make([]snet.Path, len(set))
-	for i, rp := range set {
-		paths[i] = rp.p
-		if o.ExpCorruptPath == i+1 {
-			paths[i] = corruptFirstHopMAC(rp.p)
-		}
-	}
+	paths := attemptPaths(set, o.ExpCorruptPath, o.ExpSamePath && !copyMode)
 
 	remote := &snet.UDPAddr{IA: dstIA, Host: net.UDPAddrFromAddrPort(netip.AddrPortFrom(host, c.Port))}
 	tlsConf := h3TLSConfig(o.TLS, host.String())
 	if !copyMode {
-		// Default 50 ms, not below 10 ms, not above the Connection Attempt
-		// Delay in use.
-		delay := pathAttemptDelay(o.PathAttemptDelay, attemptDelayFrom(ctx))
+		// Default 50 ms (or derived per path from historical RTT data),
+		// not below 10 ms, not above the Connection Attempt Delay in use.
+		delays, srcs := pathAttemptDelays(o.PathAttemptDelay, o.PathAttemptDelayDerived, paths,
+			pathRTTHistory, time.Now(), attemptDelayFrom(ctx))
 		res, err := dialAttempts(ctx, attemptsDial{
-			Remote: remote, Paths: paths, Delay: delay, Topology: topo, LocalIP: localIP,
+			Remote: remote, Paths: paths, Delay: delays[0], Delays: delays, DelaySrcs: srcs,
+			Topology: topo, LocalIP: localIP,
 			TLS: tlsConf, Linger: o.Linger, OnStart: pathStartHookFrom(ctx), Reserve: pathAttemptGateFrom(ctx), BG: o.BG,
 		})
 		st := SCIONAttemptStats{
 			Label: c.Label, Remote: remote.String(), Mode: PathModeAttempts,
-			PathAttemptDelayMs: msec(delay),
-			SetupMs:            msec(time.Since(setupStart) - res.handshake),
-			HandshakeMs:        msec(res.handshake),
+			PathAttemptDelayMs: msec(delays[0]), PathAttemptDelaySrc: srcs[0], ExpSamePath: o.ExpSamePath,
+			SetupMs:     msec(time.Since(setupStart) - res.handshake),
+			HandshakeMs: msec(res.handshake),
 		}
 		if err != nil {
 			st.Err = err.Error()
@@ -711,8 +707,16 @@ func dialSCION(ctx context.Context, c Candidate, o DialerOptions) (*Established,
 			closeDaemon()
 			return nil, fmt.Errorf("hev3: dial scion %s: %w", remote, err)
 		}
-		tr, pc := res.tr, res.pc
-		return newH3Established(c, res.conn, func() error {
+		// Historical RTT data of the winning path: each attempt is a
+		// connection of its own, so QUIC's estimate is that path's. It is
+		// recorded now (handshake samples only) and again at the close,
+		// which is within the Fetch, so a later Fetch in the same process
+		// finds it.
+		tr, pc, qconn := res.tr, res.pc, res.conn
+		fp := pathFingerprint(paths[res.winner])
+		recordConnHistory(pathRTTHistory, fp, qconn)
+		return newH3Established(c, qconn, func() error {
+			recordConnHistory(pathRTTHistory, fp, qconn)
 			_ = tr.Close()
 			err := pc.Close()
 			closeDaemon()

@@ -132,12 +132,17 @@ func (c *pathConn) Handle(pkt *snet.Packet) error {
 
 // attemptsDial is the input of dialAttempts.
 type attemptsDial struct {
-	Remote   *snet.UDPAddr // remote IA + host:port
-	Paths    []snet.Path   // candidate paths, in attempt order
-	Delay    time.Duration // Path Attempt Delay
-	Topology snet.Topology
-	LocalIP  net.IP
-	TLS      *tls.Config
+	Remote *snet.UDPAddr // remote IA + host:port
+	Paths  []snet.Path   // candidate paths, in attempt order
+	Delay  time.Duration // Path Attempt Delay
+	// Delays[i], if set, is the Path Attempt Delay that follows the start
+	// of the attempt over Paths[i] (nil = Delay after every attempt), and
+	// DelaySrcs[i] its source for the statistics.
+	Delays    []time.Duration
+	DelaySrcs []string
+	Topology  snet.Topology
+	LocalIP   net.IP
+	TLS       *tls.Config
 	// Linger: how long a cancelled attempt may go on so that it can be
 	// closed with CONNECTION_CLOSE. 0 = twice the time since the first
 	// attempt started, within [50 ms, 1 s]; negative = drop at once.
@@ -218,9 +223,24 @@ type attemptOutcome struct {
 func dialAttempts(ctx context.Context, d attemptsDial) (attemptsResult, error) {
 	d.Delay = pathAttemptDelay(d.Delay, 0) // default 50 ms; MUST NOT be below 10 ms
 	n := len(d.Paths)
+	// delayAfter is the Path Attempt Delay that follows the start of the
+	// attempt over path i.
+	delayAfter := func(i int) time.Duration {
+		if i < len(d.Delays) {
+			return pathAttemptDelay(d.Delays[i], 0)
+		}
+		return d.Delay
+	}
 	set := &attemptSet{start: time.Now(), delay: d.Delay, winner: -1}
 	for i, p := range d.Paths {
 		pa := &pathAttempt{stats: PathAttemptStats{Rank: i + 1}}
+		if i < n-1 {
+			// Only a delay that is followed by a further attempt.
+			pa.stats.DelayMs = msec(delayAfter(i))
+			if i < len(d.DelaySrcs) {
+				pa.stats.DelaySrc = d.DelaySrcs[i]
+			}
+		}
 		if md := p.Metadata(); md != nil {
 			pa.stats.Fingerprint = snet.Fingerprint(md.Interfaces).String()
 			pa.stats.Interfaces = interfacesString(md)
@@ -333,7 +353,7 @@ func dialAttempts(ctx context.Context, d attemptsDial) (attemptsResult, error) {
 
 	startOne(0)
 	next := 1
-	timer := time.NewTimer(d.Delay)
+	timer := time.NewTimer(delayAfter(0))
 	defer timer.Stop()
 	if next >= n {
 		timer.Stop()
@@ -352,7 +372,7 @@ func dialAttempts(ctx context.Context, d attemptsDial) (attemptsResult, error) {
 				startOne(next)
 				next++
 				if next < n {
-					timer.Reset(d.Delay)
+					timer.Reset(delayAfter(next - 1))
 				}
 			}
 		case o := <-results:

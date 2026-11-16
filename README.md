@@ -24,8 +24,8 @@ Built for the SCION testbed at the IETF 126 hackathon
   When the attempt starts, it selects
   up to Path Attempt Count paths (fewest AS hops, random order among equals,
   then least overlap with the paths already selected: shared transit ASes,
-  then shared pairs of adjacent ASes, then shared inter-AS links; paths that expire within 5 minutes or
-  have too small an MTU are excluded) and starts a separate QUIC connection
+  then shared pairs of adjacent ASes, then shared inter-AS links; paths with too small an MTU are excluded, and a path that
+  expires within 5 minutes is selected only when no other path is left) and starts a separate QUIC connection
   on each, one Path Attempt Delay (50 ms) apart, each from its own local
   port. The first connection to complete the handshake is used; the others
   are closed. SCMP errors are recorded and do not end an attempt. SCION
@@ -39,7 +39,11 @@ Built for the SCION testbed at the IETF 126 hackathon
 - `cmd/hev3` - CLI: `hev3 https://web.scion/` fetches over whichever
   endpoint wins and prints the race table (`-json` for a JSON summary).
   SCION knobs: `-k` (Path Attempt Count, default 2), `-path-attempt-delay`
-  (default 50ms, not below 10ms), `-family-order scion-first|ip-first`,
+  (default 50ms, not below 10ms), `-path-attempt-delay-derived` (the delay
+  after an attempt over a path is smoothed RTT + 2 x RTT variation of that
+  path from connections earlier in the same process, else 50ms; reported as
+  `path_attempt_delay_ms`/`path_attempt_delay_src` and per path as
+  `delay_ms`/`delay_src` in `-json`), `-family-order scion-first|ip-first`,
   `-daemon`, `-max-ases` (limit on destination ASes with a path lookup,
   default 4), `-rr-type https|svcb|both` (default `https`; `both` also
   sends an SVCB query, for zones that publish only SVCB records).
@@ -54,7 +58,10 @@ Built for the SCION testbed at the IETF 126 hackathon
   each, shared daemon connection), `-stats` (per-run path lookup time, path
   attempts with start offsets, packets and octets per path, winning path,
   SCMP events; also in `-json`), `-exp-corrupt-path N` (corrupt the first
-  hop MAC of path N so the first router drops it), `-exp-refresh-paths`
+  hop MAC of path N so the first router drops it), `-exp-same-path` (the
+  second and further attempts use candidate path 1 again instead of the
+  next candidate path; with `-exp-corrupt-path 1` every attempt is
+  corrupted), `-exp-refresh-paths`
   (ask the daemon to fetch paths anew), `-linger` (how long a losing
   connection is kept so that it can be closed with CONNECTION_CLOSE),
   `-deterministic-paths` (no random order among equal paths).

@@ -776,8 +776,8 @@ route"</code> timeline note.</li>
 </ul>
 
 <h3>Path selection <span class="file">pkg/hev3/pathset.go</span></h3>
-<p><code>selectPathSet</code>: expired paths are excluded; paths expiring within 2s only if nothing else
-is left; paths whose metadata MTU cannot carry a 1200-octet QUIC datagram plus the SCION (common,
+<p><code>selectPathSet</code>: expired paths are excluded; a path expiring within 5 minutes is selected only when
+no other path is left to select; paths whose metadata MTU cannot carry a 1200-octet QUIC datagram plus the SCION (common,
 address, path) and UDP headers are excluded (SCION dials pin quic-go's <code>InitialPacketSize</code> to
 1200 so the check matches). Ranking is greedy (<code>rankGreedy</code>): first the path with the fewest
 AS hops, then repeatedly the path with the least overlap with those already selected (shared transit

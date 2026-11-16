@@ -145,3 +145,54 @@ func recordHistory(h *rttHistory, r *pathRacer, cs quic.ConnectionStats, now tim
 		h.record(fp, sample, sample/2, now)
 	}
 }
+
+// Derived Path Attempt Delay (draft-john-scion-happy-eyeballs, "Attempts
+// over Paths": a client MAY derive the Path Attempt Delay from historical
+// round-trip time data). The delay that follows the start of an attempt
+// over a path is smoothed_rtt + 2*rttvar of that path from rttHistory, fed
+// by the connections established earlier in the same process; without
+// history for the path, the default 50 ms. Either way it is at least
+// minPathAttemptDelay and at most the Connection Attempt Delay in use.
+
+// pathAttemptDelays returns the Path Attempt Delay that follows the start
+// of the attempt over each of paths, and its source: delaySrcFixed for
+// every path unless derived is set (configured is then not used); with
+// derived, delaySrcHistory or delaySrcDefault per path. attemptDelay
+// (0 = unknown) caps every value.
+func pathAttemptDelays(configured time.Duration, derived bool, paths []snet.Path,
+	hist *rttHistory, now time.Time, attemptDelay time.Duration) ([]time.Duration, []string) {
+
+	ds := make([]time.Duration, len(paths))
+	srcs := make([]string, len(paths))
+	for i, p := range paths {
+		if !derived {
+			ds[i], srcs[i] = pathAttemptDelay(configured, attemptDelay), delaySrcFixed
+			continue
+		}
+		ds[i], srcs[i] = pathAttemptDelay(0, attemptDelay), delaySrcDefault
+		if srtt, rttvar, ok := hist.lookup(pathFingerprint(p), now); ok {
+			ds[i], srcs[i] = pathAttemptDelay(srtt+2*rttvar, attemptDelay), delaySrcHistory
+		}
+	}
+	return ds, srcs
+}
+
+// recordConnHistory stores QUIC's RTT estimate of conn as historical RTT
+// data of the path with fingerprint fp (attempts mode: one path per
+// connection).
+func recordConnHistory(h *rttHistory, fp string, conn *quic.Conn) {
+	cs := conn.ConnectionStats()
+	h.record(fp, cs.SmoothedRTT, cs.MeanDeviation, time.Now())
+}
+
+// pathFingerprint is the interface fingerprint of p; "" without metadata.
+func pathFingerprint(p snet.Path) string {
+	if p == nil {
+		return ""
+	}
+	md := p.Metadata()
+	if md == nil {
+		return ""
+	}
+	return snet.Fingerprint(md.Interfaces).String()
+}

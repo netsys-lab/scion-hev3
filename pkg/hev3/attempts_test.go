@@ -249,6 +249,96 @@ func withExpiry(p snet.Path, at time.Time) snet.Path {
 	return expiryPath{Path: p, md: &md}
 }
 
+// Same-path arm (ExpSamePath): the second attempt goes over the first
+// candidate path again, still as a separate connection from its own local
+// port, one Path Attempt Delay later; the second candidate path is unused.
+func TestAttempts_SamePathSecondAttempt(t *testing.T) {
+	e := newEmuEnv(t, []relayMode{relayForward, relayForward}, 15*time.Millisecond)
+	var bg sync.WaitGroup
+	paths := attemptPaths([]rankedPath{{p: e.paths[0]}, {p: e.paths[1]}}, 0, true)
+	res, err := e.attempts(t, context.Background(), attemptsDial{Paths: paths, Delay: 10 * time.Millisecond, BG: &bg})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bg.Wait()
+	_, ps := res.set.snapshot()
+	if len(ps) != 2 || !ps[0].Started || !ps[1].Started {
+		t.Fatalf("%d attempts, want 2 started", len(ps))
+	}
+	if ps[0].Fingerprint == "" || ps[0].Fingerprint != ps[1].Fingerprint {
+		t.Fatalf("fingerprints %q, %q: want the first path twice", ps[0].Fingerprint, ps[1].Fingerprint)
+	}
+	if gap := ps[1].StartMs - ps[0].StartMs; gap < 9.5 || gap > 40 {
+		t.Fatalf("second attempt started %.1fms after the first, want ~10ms", gap)
+	}
+	if ps[0].LocalPort == 0 || ps[0].LocalPort == ps[1].LocalPort {
+		t.Fatalf("local ports %d and %d: want two different ports", ps[0].LocalPort, ps[1].LocalPort)
+	}
+	if ps[1].SentPkts == 0 {
+		t.Fatalf("the second attempt sent nothing")
+	}
+	if up := e.relays[1].up.Load(); up != 0 {
+		t.Fatalf("path 2 carried %d packets, want 0", up)
+	}
+}
+
+// Per-path Path Attempt Delays: the delay that follows the start of each
+// attempt is that path's, and it is reported with its source; the last
+// attempt has none.
+func TestAttempts_PerPathDelays(t *testing.T) {
+	e := newEmuEnv(t, []relayMode{relayDrop, relayDrop, relayForward}, time.Millisecond)
+	res, err := e.attempts(t, context.Background(), attemptsDial{
+		Delays:    []time.Duration{15 * time.Millisecond, 60 * time.Millisecond, 40 * time.Millisecond},
+		DelaySrcs: []string{delaySrcHistory, delaySrcDefault, delaySrcHistory},
+		Linger:    -1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.winner != 2 {
+		t.Fatalf("winner = path %d, want path 3", res.winner+1)
+	}
+	_, ps := res.set.snapshot()
+	if g := ps[1].StartMs - ps[0].StartMs; g < 14.5 || g > 45 {
+		t.Errorf("path 2 started %.1fms after path 1, want ~15ms", g)
+	}
+	if g := ps[2].StartMs - ps[1].StartMs; g < 59.5 || g > 90 {
+		t.Errorf("path 3 started %.1fms after path 2, want ~60ms", g)
+	}
+	if ps[0].DelayMs != 15 || ps[0].DelaySrc != delaySrcHistory || ps[1].DelayMs != 60 || ps[1].DelaySrc != delaySrcDefault {
+		t.Errorf("reported delays %v (%s), %v (%s); want 15 (history), 60 (default)", ps[0].DelayMs, ps[0].DelaySrc, ps[1].DelayMs, ps[1].DelaySrc)
+	}
+	if ps[2].DelayMs != 0 || ps[2].DelaySrc != "" {
+		t.Errorf("last path reports a delay %v (%s), want none", ps[2].DelayMs, ps[2].DelaySrc)
+	}
+}
+
+// History from an established attempt: QUIC's estimate of the winning
+// connection is stored for the winning path (also once the connection is
+// closed), and a later dial derives the delay after that path from it.
+func TestAttempts_HistoryFeedsDerivedDelay(t *testing.T) {
+	e := newEmuEnv(t, []relayMode{relayForward, relayForward}, 5*time.Millisecond)
+	res, err := e.attempts(t, context.Background(), attemptsDial{Delay: 500 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := newRTTHistory()
+	fp := pathFingerprint(e.paths[res.winner])
+	_ = res.conn.CloseWithError(0, "")
+	recordConnHistory(h, fp, res.conn)
+	srtt, rttvar, ok := h.lookup(fp, time.Now())
+	if !ok || srtt < 10*time.Millisecond || srtt > 200*time.Millisecond {
+		t.Fatalf("history of path %d: %v/%v/%v, want QUIC's estimate (~10ms RTT)", res.winner+1, srtt, rttvar, ok)
+	}
+	ds, srcs := pathAttemptDelays(0, true, e.paths, h, time.Now(), 250*time.Millisecond)
+	if srcs[0] != delaySrcHistory || ds[0] != max(srtt+2*rttvar, minPathAttemptDelay) {
+		t.Errorf("path 1: %v (%s), want %v from history", ds[0], srcs[0], srtt+2*rttvar)
+	}
+	if srcs[1] != delaySrcDefault || ds[1] != defaultPathAttemptDelay {
+		t.Errorf("path 2: %v (%s), want the default", ds[1], srcs[1])
+	}
+}
+
 func TestAttempts_NoPaths(t *testing.T) {
 	res, err := dialAttempts(context.Background(), attemptsDial{})
 	if !errors.Is(err, errNoEligiblePath) || res.set == nil {

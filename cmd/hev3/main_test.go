@@ -157,11 +157,17 @@ func TestRun_SCIONFlags(t *testing.T) {
 	if code := run(args, null, null); code != 1 {
 		t.Errorf("run(scion flags) = %d, want 1 (accepted, fetch fails fast)", code)
 	}
+	args = []string{"-path-attempt-delay-derived", "-exp-same-path", "-exp-corrupt-path", "1", "-repeat", "2", "-json",
+		"-daemon", "127.0.0.1:1", "-resolver", "127.0.0.1:1", "-timeout", "1ms", "https://nosuch.invalid/"}
+	if code := run(args, null, null); code != 1 {
+		t.Errorf("run(attempts-mode experiment flags) = %d, want 1 (accepted, fetch fails fast)", code)
+	}
 	args = []string{"-scion", "1-ff00:0:110,127.0.0.1:1", "-daemon", "127.0.0.1:1", "-timeout", "50ms", "https://example.test/"}
 	if code := run(args, null, null); code != 1 {
 		t.Errorf("run(-scion target, no daemon) = %d, want 1", code)
 	}
-	for _, bad := range [][]string{{"-k", "0"}, {"-repeat", "0"}, {"-exp-corrupt-path", "-1"}, {"-path-delay", "-1ms"}, {"-path-delay", "fast"}, {"-path-mode", "x"}, {"-family-order", "x"}} {
+	for _, bad := range [][]string{{"-k", "0"}, {"-repeat", "0"}, {"-exp-corrupt-path", "-1"}, {"-path-delay", "-1ms"}, {"-path-delay", "fast"}, {"-path-mode", "x"}, {"-family-order", "x"},
+		{"-path-mode", "copy", "-exp-same-path"}, {"-path-mode", "copy", "-path-attempt-delay-derived"}} {
 		if code := run(append(bad, "https://web.scion/"), null, null); code != 2 {
 			t.Errorf("run(%v) = %d, want 2", bad, code)
 		}
